@@ -133,7 +133,7 @@ export default function piq(pi: ExtensionAPI): void {
   }
 
   function resumeIfReady(current: Binding): void {
-    if (current.closed || !current.resumeTurn || current.control?.paused || !current.transport.isConnected || !current.ctx.isIdle()) return;
+    if (current.closed || !current.resumeTurn || current.control?.paused || !current.transport.isConnected || syncing(current) || !current.ctx.isIdle()) return;
     current.resumeTurn = false;
     if (current.store.pending()) { current.notifier.schedule(); return; }
     pi.sendMessage({ customType: 'piq:resume', content: 'PiQ 已恢复，可继续处理刚才中断的对话任务。', display: true }, { triggerTurn: true, deliverAs: 'followUp' });
@@ -246,6 +246,7 @@ export default function piq(pi: ExtensionAPI): void {
         shutdown: () => current.ctx.shutdown(),
         error: error => report(current, `运行控制：${error instanceof Error ? error.message : String(error)}`),
       });
+      current.resumeTurn ||= current.control.needsResume;
       if (current.control.paused) current.notifier.suspend();
       binding = current;
       current.notifier.schedule();
@@ -262,11 +263,18 @@ export default function piq(pi: ExtensionAPI): void {
   });
 
   pi.on('session_shutdown', stop);
-  pi.on('agent_settled', (_event, ctx) => {
+  pi.on('agent_start', async (_event, ctx) => {
     if (!binding || binding.closed) return;
     binding.ctx = ctx;
-    resumeIfReady(binding);
-    binding.notifier.schedule();
+    await binding.control?.markBusy(true);
+  });
+  pi.on('agent_settled', async (_event, ctx) => {
+    if (!binding || binding.closed) return;
+    const current = binding;
+    current.ctx = ctx;
+    await current.control?.markBusy(false);
+    resumeIfReady(current);
+    current.notifier.schedule();
   });
 
   pi.on('message_end', async event => {

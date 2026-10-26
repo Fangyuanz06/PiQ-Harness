@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
-import { RunController, readRuntimeStatus, requestRunAction, type ConnectionState } from '../src/run-control.ts';
+import { RunController, clearInterruptedWork, readRuntimeStatus, requestRunAction, type ConnectionState } from '../src/run-control.ts';
 
 async function eventually(check: () => boolean | Promise<boolean>): Promise<void> {
   const deadline = Date.now() + 3_000;
@@ -109,4 +109,92 @@ test('invalid actions and missing owners cannot create control requests', async 
   await rm(join(f.cwd, '.piq', 'owner.lock'));
   await assert.rejects(requestRunAction(f.cwd, 'pause'), /未运行/);
   assert.equal(await readRuntimeStatus(f.cwd), null);
+});
+
+test('busy work survives owner replacement while settled work needs no continuation', async t => {
+  const f = await fixture(t);
+  const first = await f.open();
+  await first.markBusy(true);
+  assert.equal(first.needsResume, true);
+  assert.deepEqual(JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')),
+    { version: 1, paused: false, interrupted: true });
+  await first.close();
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ ...f.owner, token: randomUUID() }));
+  const replacement = await f.open();
+  assert.equal(replacement.needsResume, true);
+  await replacement.markBusy(false);
+  assert.equal(replacement.needsResume, false);
+  await replacement.close();
+  const idle = await f.open();
+  assert.equal(idle.needsResume, false);
+  assert.deepEqual(f.calls, []);
+});
+
+test('pause retains interrupted work through settling and resume until completion', async t => {
+  const f = await fixture(t);
+  const controller = await f.open();
+  await controller.markBusy(true);
+  const pause = await requestRunAction(f.cwd, 'pause');
+  await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === pause.requestId);
+  await controller.markBusy(false);
+  assert.equal(controller.needsResume, false);
+  assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted, true);
+  const resume = await requestRunAction(f.cwd, 'resume');
+  await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === resume.requestId);
+  assert.equal(controller.needsResume, true);
+  await controller.markBusy(false);
+  assert.equal(controller.needsResume, false);
+  assert.deepEqual(f.calls, ['pause', 'resume', true]);
+});
+
+test('manual work during an idle pause does not create unfinished automatic work', async t => {
+  const f = await fixture(t); f.state.busy = false;
+  const controller = await f.open();
+  const pause = await requestRunAction(f.cwd, 'pause');
+  await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === pause.requestId);
+  await controller.markBusy(true); await controller.markBusy(false);
+  const resume = await requestRunAction(f.cwd, 'resume');
+  await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === resume.requestId);
+  assert.equal(controller.needsResume, false);
+  assert.deepEqual(f.calls, ['pause', 'resume', false]);
+});
+
+test('handoff retains unfinished work even when shutdown settles, explicit stop clears it', async t => {
+  const f = await fixture(t);
+  const first = await f.open();
+  await first.markBusy(true);
+  const handoff = await requestRunAction(f.cwd, 'handoff');
+  await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === handoff.requestId);
+  await first.markBusy(false);
+  assert.equal(first.needsResume, true);
+  await first.close();
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ ...f.owner, token: randomUUID() }));
+  const next = await f.open();
+  const stopped = await requestRunAction(f.cwd, 'shutdown');
+  await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === stopped.requestId);
+  await next.markBusy(true);
+  assert.equal(next.needsResume, false);
+  assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted, false);
+});
+
+test('an old controller cannot overwrite the new owner continuation state', async t => {
+  const f = await fixture(t);
+  const old = await f.open();
+  await old.markBusy(true);
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ ...f.owner, token: randomUUID() }));
+  await writeFile(join(f.cwd, '.piq', 'run-preferences.json'), JSON.stringify({ version: 1, paused: false, interrupted: false }));
+  await old.markBusy(true); await old.markBusy(false);
+  assert.deepEqual(JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')),
+    { version: 1, paused: false, interrupted: false });
+});
+
+test('stop clears unfinished work after the owner exits and preserves pause preference', async t => {
+  const f = await fixture(t);
+  await rm(join(f.cwd, '.piq', 'owner.lock'));
+  await clearInterruptedWork(f.cwd);
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'run-preferences.json')), { code: 'ENOENT' });
+  await writeFile(join(f.cwd, '.piq', 'run-preferences.json'), JSON.stringify({ version: 1, paused: true, interrupted: true }));
+  await clearInterruptedWork(f.cwd);
+  assert.deepEqual(JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')),
+    { version: 1, paused: true, interrupted: false });
 });

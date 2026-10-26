@@ -94,6 +94,7 @@ test('starts one isolated hidden worker with credentials only in its environment
   assert.doesNotMatch(JSON.stringify(launches[0]!.args), /private-token/);
   assert.deepEqual(await getProcessStatus(f.cwd), { running: true, pid: process.pid, mode: 'background', starting: false });
   await assert.rejects(readFile(join(f.cwd, '.piq', 'start.lock')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'worker-launch.json')), { code: 'ENOENT' });
 });
 
 test('concurrent starts and existing terminal owners cannot create duplicate sessions', async t => {
@@ -113,6 +114,23 @@ test('concurrent starts and existing terminal owners cannot create duplicate ses
   assert.equal(launches, 1);
 });
 
+test('automatic terminal return preserves pause and unfinished work instead of forcing a fresh run', async t => {
+  const f = await fixture(t);
+  const preferences = { version: 1, paused: true, interrupted: true };
+  const preferenceFile = join(f.cwd, '.piq', 'run-preferences.json');
+  await writeFile(preferenceFile, JSON.stringify(preferences));
+  let launch: BackgroundLaunch | undefined;
+  await startGroup(f.cwd, { preserveRunState: true, env: { PIQ_START_RUNNING: '1', SNOWLUMA_ACCESS_TOKEN: 'test-only' },
+    launch: async specification => {
+      launch = specification;
+      await f.owner(); await f.record(specification.env.PIQ_LAUNCH_ID);
+      return { pid: process.pid };
+    } });
+  assert.equal(launch!.env.PIQ_START_RUNNING, undefined);
+  assert.equal(launch!.env.PIQ_RUN_MODE, 'background');
+  assert.deepEqual(JSON.parse(await readFile(preferenceFile, 'utf8')), preferences);
+});
+
 test('a still-starting worker is reported without dispatching a second launch', async t => {
   const f = await fixture(t);
   let launches = 0;
@@ -127,6 +145,68 @@ test('a still-starting worker is reported without dispatching a second launch', 
   assert.equal(launches, 1);
 });
 
+test('a parent launch stays visible before the child writes its first worker record', async t => {
+  const f = await fixture(t);
+  let launches = 0;
+  let launchId: string | undefined;
+  const options = { timeoutMs: 1, env: { SNOWLUMA_ACCESS_TOKEN: 'private-startup-token' }, launch: async (spec: BackgroundLaunch) => {
+    launches++;
+    launchId = spec.env.PIQ_LAUNCH_ID;
+    return { pid: process.pid, exited: () => false };
+  } };
+  assert.equal((await startGroup(f.cwd, options)).starting, true);
+  await assert.rejects(readFile(f.workerFile), { code: 'ENOENT' });
+  assert.deepEqual(await getProcessStatus(f.cwd), { running: false, pid: process.pid, mode: 'background', starting: true });
+  const duplicate = await startGroup(f.cwd, options);
+  assert.equal(duplicate.alreadyRunning, true);
+  assert.equal(duplicate.starting, true);
+  assert.equal(launches, 1);
+  const launchFile = join(f.cwd, '.piq', 'worker-launch.json');
+  const stored = await readFile(launchFile, 'utf8');
+  assert.doesNotMatch(stored, /private-startup-token|SNOWLUMA_ACCESS_TOKEN|env/);
+  const pending = JSON.parse(stored);
+  assert.deepEqual(Object.keys(pending).sort(), ['launchId', 'pid', 'startedAt', 'version']);
+  assert.equal(pending.launchId, launchId);
+  assert.equal(pending.pid, process.pid);
+
+  await f.owner(); await f.record(launchId);
+  assert.deepEqual(await getProcessStatus(f.cwd), { running: true, pid: process.pid, mode: 'background', starting: false });
+  await unlink(f.ownerFile); await f.record(launchId, 'stopped');
+  assert.deepEqual(await getProcessStatus(f.cwd), { running: false, pid: null, mode: null, starting: false });
+});
+
+test('a new parent launch supersedes an older worker record while later terminal records remain authoritative', async t => {
+  const f = await fixture(t);
+  await writeFile(f.workerFile, JSON.stringify({ version: 1, mode: 'background', pid: process.pid,
+    launchId: 'previous-launch', startedAt: 1, state: 'stopped' }));
+  let launchId: string | undefined;
+  await startGroup(f.cwd, { timeoutMs: 1, env: { SNOWLUMA_ACCESS_TOKEN: 'test-only' }, launch: async spec => {
+    launchId = spec.env.PIQ_LAUNCH_ID;
+    return { pid: process.pid };
+  } });
+  assert.equal((await getProcessStatus(f.cwd)).starting, true);
+  for (const state of ['running', 'stopped', 'error']) {
+    await f.record(launchId, state);
+    assert.equal((await getProcessStatus(f.cwd)).starting, false, `${state} must supersede the pending parent launch`);
+  }
+  await f.record('a-later-launch', 'stopped');
+  assert.equal((await getProcessStatus(f.cwd)).starting, false, 'an older parent record cannot revive after a replacement worker finishes');
+});
+
+test('dead launch PIDs are ignored and pending launches cannot replace a live owner', async t => {
+  const f = await fixture(t);
+  const { stdout } = await promisify(execFile)(process.execPath, ['-e', 'console.log(process.pid)']);
+  const deadPid = Number(stdout.trim());
+  const launchFile = join(f.cwd, '.piq', 'worker-launch.json');
+  await writeFile(launchFile, JSON.stringify({ version: 1, pid: deadPid, launchId: 'dead-launch', startedAt: Date.now() }));
+  assert.deepEqual(await getProcessStatus(f.cwd), { running: false, pid: null, mode: null, starting: false });
+  const pending = JSON.stringify({ version: 1, pid: process.pid, launchId: 'still-importing', startedAt: Date.now() });
+  await writeFile(launchFile, pending);
+  await f.owner();
+  assert.deepEqual(await getProcessStatus(f.cwd), { running: true, pid: process.pid, mode: 'terminal', starting: false });
+  assert.equal(await readFile(launchFile, 'utf8'), pending);
+});
+
 test('startup failure is visible and releases the startup lease', async t => {
   const f = await fixture(t);
   await assert.rejects(startGroup(f.cwd, { env: { SNOWLUMA_ACCESS_TOKEN: 'test' }, launch: async spec => {
@@ -135,6 +215,7 @@ test('startup failure is visible and releases the startup lease', async t => {
   } }), /启动失败/);
   assert.match((await getProcessStatus(f.cwd)).error!, /启动失败/);
   await assert.rejects(readFile(join(f.cwd, '.piq', 'start.lock')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'worker-launch.json')), { code: 'ENOENT' });
 });
 
 test('handoff waits for the background owner to release before opening its existing session directory', async t => {

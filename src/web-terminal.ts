@@ -4,6 +4,7 @@ import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultMessagesRoot, resolvePiCommand } from './cli.ts';
 import { loadConfig, type GroupConfig } from './config.ts';
+import { cancelTerminalReturn, prepareTerminalReturn } from './terminal-monitor.ts';
 
 export interface CredentialStatus {
   available: boolean;
@@ -128,7 +129,11 @@ export interface TerminalLaunch {
 
 export interface TerminalOptions extends CredentialOptions {
   launch?: (specification: TerminalLaunch) => Promise<void>;
+  prepareReturn?: typeof prepareTerminalReturn;
+  cancelReturn?: typeof cancelTerminalReturn;
 }
+
+const openingTerminals = new Map<string, Promise<{ message: string; alreadyRunning?: boolean }>>();
 
 async function launchTerminal(specification: TerminalLaunch): Promise<void> {
   await new Promise<void>((resolveLaunch, reject) => {
@@ -153,25 +158,47 @@ async function powerShell(env: NodeJS.ProcessEnv): Promise<string> {
 
 export async function openGroupTerminal(cwd: string, options: TerminalOptions = {}): Promise<{ message: string; alreadyRunning?: boolean }> {
   const directory = resolve(cwd);
-  const config = await loadConfig(directory);
-  if (!config) throw new Error('请先初始化本群目录。');
-  if (!config.conversations.length) throw new Error('请先给对话组添加至少一个对话。');
-  const owner = await getRunningOwner(directory);
-  if (owner.running) return { message: `本群 Pi 已在终端运行（PID ${owner.pid}），请切换到已有终端。`, alreadyRunning: true };
-  if (process.platform !== 'win32' && !options.launch) throw new Error('终端入口目前支持 Windows；请在本群目录中手动运行 Pi。');
-  const { env } = await resolveGroupEnvironment(directory, config, options);
-  // Validate installation before reporting a successful request to the browser.
-  await resolvePiCommand(env);
-  const sourceRoot = fileURLToPath(new URL('../', import.meta.url));
-  await (options.launch ?? launchTerminal)({
-    command: 'wt.exe',
-    args: ['-w', 'new', 'new-tab', '--inheritEnvironment', '--title', `PiQ ${config.name}`,
-      await powerShell(env),
-      '-NoLogo', '-NoProfile', '-NoExit', '-File', join(sourceRoot, 'scripts', 'open-pi.ps1')],
-    cwd: directory,
-    // Group paths go through environment variables, not WT's command syntax.
-    env: { ...env, PIQ_GROUP_DIRECTORY: directory, PIQ_NODE_EXECUTABLE: process.execPath,
-      PIQ_TERMINAL_ENTRY: join(sourceRoot, 'src', 'terminal-entry.ts') },
-  });
-  return { message: '已请求打开终端，并继续本群最近的 Pi 会话。' };
+  const existing = openingTerminals.get(directory);
+  if (existing) {
+    await existing;
+    return { message: '终端正在打开，请稍候。', alreadyRunning: true };
+  }
+  const operation = (async () => {
+    const config = await loadConfig(directory);
+    if (!config) throw new Error('请先初始化本群目录。');
+    if (!config.conversations.length) throw new Error('请先给对话组添加至少一个对话。');
+    const owner = await getRunningOwner(directory);
+    if (owner.running) return { message: `本群 Pi 已在终端运行（PID ${owner.pid}），请切换到已有终端。`, alreadyRunning: true };
+    if (process.platform !== 'win32' && !options.launch) throw new Error('终端入口目前支持 Windows；请在本群目录中手动运行 Pi。');
+    const { env } = await resolveGroupEnvironment(directory, config, options);
+    // Validate installation before creating a return lease or opening a window.
+    await resolvePiCommand(env);
+    const shell = await powerShell(env);
+    const sourceRoot = fileURLToPath(new URL('../', import.meta.url));
+    const cancel = options.cancelReturn ?? cancelTerminalReturn;
+    const lease = await (options.prepareReturn ?? prepareTerminalReturn)(directory, { env });
+    if (lease.alreadyRunning) return { message: '终端正在打开或已由本群接管，请切换到已有终端。', alreadyRunning: true };
+    try {
+      if ((await getRunningOwner(directory)).running) {
+        await cancel(directory, lease.token);
+        return { message: '本群会话已由其他实例接管，请刷新状态。', alreadyRunning: true };
+      }
+      await (options.launch ?? launchTerminal)({
+        command: 'wt.exe',
+        args: ['-w', 'new', 'new-tab', '--inheritEnvironment', '--title', `PiQ ${config.name}`,
+          shell, '-NoLogo', '-NoProfile', '-NoExit', '-File', join(sourceRoot, 'scripts', 'open-pi.ps1')],
+        cwd: directory,
+        // Group paths and tokens go through the child environment, not WT command syntax.
+        env: { ...env, PIQ_GROUP_DIRECTORY: directory, PIQ_NODE_EXECUTABLE: process.execPath,
+          PIQ_TERMINAL_ENTRY: join(sourceRoot, 'src', 'terminal-entry.ts'), PIQ_TERMINAL_RETURN_TOKEN: lease.token },
+      });
+      return { message: '已请求打开终端，并继续本群最近的 Pi 会话。关闭终端后会自动回到后台。' };
+    } catch (error) {
+      await cancel(directory, lease.token);
+      throw error;
+    }
+  })();
+  openingTerminals.set(directory, operation);
+  try { return await operation; }
+  finally { if (openingTerminals.get(directory) === operation) openingTerminals.delete(directory); }
 }

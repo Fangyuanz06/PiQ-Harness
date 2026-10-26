@@ -76,7 +76,7 @@ async function fixture(t: TestContext, responses: FauxResponseStep[], options: {
   const faux = fauxProvider({ provider: 'piq-pause-local', tokensPerSecond: 1_000_000 }); faux.setResponses(responses);
   const modelRuntime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, refreshOnCreate: false });
   modelRuntime.registerNativeProvider(faux.provider);
-  const { session } = await createAgentSession({ cwd, agentDir, modelRuntime, model: faux.getModel(), settingsManager,
+  let { session } = await createAgentSession({ cwd, agentDir, modelRuntime, model: faux.getModel(), settingsManager,
     resourceLoader: loader, sessionManager: SessionManager.create(cwd, join(cwd, '.pi', 'sessions')) });
   const errors: ExtensionError[] = [];
   const notices: string[] = [];
@@ -89,11 +89,23 @@ async function fixture(t: TestContext, responses: FauxResponseStep[], options: {
       await rm(root, { recursive: true, force: true });
     }
   });
-  await session.bindExtensions({ mode: 'print', onError: error => errors.push(error) });
+  await session.bindExtensions({ mode: 'print', shutdownHandler: () => {}, onError: error => errors.push(error) });
   await eventually(() => LocalSocket.instances.length > 0, 'a test socket');
   const socket = LocalSocket.instances.at(-1)!;
   if (!options.offline) await eventually(async () => (await readRuntimeStatus(cwd))?.connection === 'connected', 'connected runtime');
-  return { cwd, session, faux, socket, errors, notices };
+  const restart = async () => {
+    await session.abort();
+    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+    session.dispose();
+    await loader.reload();
+    ({ session } = await createAgentSession({ cwd, agentDir, modelRuntime, model: faux.getModel(), settingsManager,
+      resourceLoader: loader, sessionManager: SessionManager.continueRecent(cwd, join(cwd, '.pi', 'sessions')) }));
+    t.mock.method(session.extensionRunner.createContext().ui, 'notify', (text: string) => notices.push(text));
+    await session.bindExtensions({ mode: 'print', shutdownHandler: () => {}, onError: error => errors.push(error) });
+    await eventually(async () => (await readRuntimeStatus(cwd))?.connection === 'connected', 'replacement connection');
+    return session;
+  };
+  return { cwd, session, faux, socket, errors, notices, restart };
 }
 
 test('real Pi pauses automatic wakeups and sending, keeps records, then resumes one aggregated signal', async t => {
@@ -157,4 +169,49 @@ test('pausing an active Pi run aborts it and resume continues even without new g
     assert.equal(f.socket.sent.filter(packet => packet.action === 'send_group_msg').length, 0);
     assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
   } finally { release(); }
+});
+
+test('an unfinished handoff continues the same Pi session after restart with no pending QQ message', async t => {
+  let release = () => {};
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let markedBeforeModel = false;
+  const f = await fixture(t, [
+    async () => {
+      markedBeforeModel = JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted === true;
+      await gate;
+      return fauxAssistantMessage('Interrupted by closing the terminal.');
+    },
+    fauxAssistantMessage('Continuing the existing work in the background.'),
+  ]);
+  try {
+    const sessionId = f.session.sessionManager.getSessionId();
+    const incoming = message(20, 'Work that takes a while');
+    LocalSocket.history = [incoming];
+    f.socket.receive(incoming);
+    await eventually(() => f.faux.state.callCount === 1 && markedBeforeModel, 'durable busy marker before model work');
+    await eventually(async () => (await readRuntimeStatus(f.cwd))?.pendingCount === 0, 'the notification to be acknowledged');
+    const handoff = await requestRunAction(f.cwd, 'handoff');
+    await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === handoff.requestId, 'handoff acknowledgement');
+    const aborting = f.session.abort(); release(); await aborting;
+    assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted, true);
+    const replacement = await f.restart();
+    await eventually(() => f.faux.state.callCount === 2 && replacement.isIdle, 'resumed work after restart');
+    assert.equal(replacement.sessionManager.getSessionId(), sessionId);
+    assert.equal(replacement.messages.filter(item => item.role === 'custom' && item.customType === 'piq:resume').length, 1);
+    await eventually(async () => !JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted, 'completed continuation marker');
+    assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
+  } finally { release(); }
+});
+
+test('reopening an idle Pi session keeps its history without starting a new model turn', async t => {
+  const f = await fixture(t, [fauxAssistantMessage('Finished before the terminal closed.')]);
+  await f.session.prompt('A local task that has already finished.');
+  const sessionId = f.session.sessionManager.getSessionId();
+  await eventually(async () => !JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted, 'idle state saved');
+  const replacement = await f.restart();
+  await delay(200);
+  assert.equal(replacement.sessionManager.getSessionId(), sessionId);
+  assert.equal(f.faux.state.callCount, 1);
+  assert.equal(replacement.messages.filter(item => item.role === 'custom' && item.customType === 'piq:resume').length, 0);
+  assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
 });

@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdir, open, readFile, realpath, lstat, unlink } from 'node:fs/promises';
+import { mkdir, open, readFile, realpath, lstat, rename, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { loadConfig } from './config.ts';
 import { getRunningOwner, openGroupTerminal, resolveGroupEnvironment, type CredentialOptions } from './web-terminal.ts';
+import { getTerminalReturnError } from './terminal-monitor.ts';
 
 interface Worker {
   version: 1;
@@ -17,6 +18,13 @@ interface Worker {
   ownerToken?: string;
   error?: string;
   lastError?: string;
+}
+
+interface PendingLaunch {
+  version: 1;
+  pid: number;
+  launchId: string;
+  startedAt: number;
 }
 
 export interface ProcessStatus {
@@ -69,6 +77,41 @@ async function worker(cwd: string): Promise<Worker | null> {
   } catch (error) { if (missing(error)) return null; throw new Error('后台运行记录无效，请检查本群 .piq/worker.json。'); }
 }
 
+async function pendingLaunch(cwd: string): Promise<PendingLaunch | null> {
+  try {
+    const path = await localPath(cwd, 'worker-launch.json');
+    if ((await lstat(path)).size > 16_384) throw new Error();
+    const value: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!object(value) || value.version !== 1 || !Number.isSafeInteger(value.pid) || Number(value.pid) <= 0
+      || typeof value.launchId !== 'string' || !value.launchId || typeof value.startedAt !== 'number'
+      || !Number.isFinite(value.startedAt) || value.startedAt < 0) throw new Error();
+    return value as unknown as PendingLaunch;
+  } catch (error) { if (missing(error)) return null; throw new Error('后台启动记录无效，请检查本群 .piq/worker-launch.json。'); }
+}
+
+async function savePendingLaunch(cwd: string, launch: PendingLaunch): Promise<void> {
+  const path = await localPath(cwd, 'worker-launch.json', true);
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    const handle = await open(temporary, 'wx', 0o600);
+    try { await handle.writeFile(JSON.stringify(launch) + '\n', 'utf8'); await handle.sync(); }
+    finally { await handle.close(); }
+    for (let attempt = 0; ; attempt++) {
+      try { await localPath(cwd, 'worker-launch.json'); await rename(temporary, path); break; }
+      catch (error) {
+        if (process.platform !== 'win32' || attempt >= 5 || !['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+        await delay(20 * (attempt + 1));
+      }
+    }
+  } finally { await unlink(temporary).catch(error => { if (!missing(error)) throw error; }); }
+}
+
+/** The startup lock is still held, so another launcher cannot replace this record. */
+async function forgetPendingLaunch(cwd: string, launchId: string): Promise<void> {
+  if ((await pendingLaunch(cwd))?.launchId !== launchId) return;
+  await unlink(await localPath(cwd, 'worker-launch.json')).catch(error => { if (!missing(error)) throw error; });
+}
+
 async function ownerToken(cwd: string): Promise<string | undefined> {
   try {
     const value: unknown = JSON.parse(await readFile(await localPath(cwd, 'owner.lock'), 'utf8'));
@@ -85,11 +128,20 @@ export async function getProcessStatus(cwd: string): Promise<ProcessStatus> {
     return { ...owner, mode: background ? 'background' : 'terminal', starting: false,
       ...(background && record.lastError ? { error: '后台 Pi 扩展运行出现错误；进程仍在运行，可切换到终端查看。' } : {}) };
   }
+  const pending = await pendingLaunch(cwd);
+  // The parent publishes this before the child has imported its modules or
+  // written worker.json. A matching ready/terminal record supersedes it.
+  if (pending && alive(pending.pid) && (!record
+    || (record.launchId !== pending.launchId && record.startedAt < pending.startedAt))) {
+    return { running: false, pid: pending.pid, mode: 'background', starting: true };
+  }
   if (record && record.state === 'starting' && alive(record.pid)) {
     return { running: false, pid: record.pid, mode: 'background', starting: true };
   }
+  const terminalError = await getTerminalReturnError(cwd);
   return { running: false, pid: null, mode: null, starting: false,
-    ...(record?.state === 'error' ? { error: '后台 Pi 启动失败，请检查本群模型配置和扩展加载情况。' } : {}) };
+    ...(terminalError ? { error: terminalError }
+      : record?.state === 'error' ? { error: '后台 Pi 启动失败，请检查本群模型配置和扩展加载情况。' } : {}) };
 }
 
 async function exclusive<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
@@ -144,6 +196,8 @@ interface LaunchedProcess { pid: number; exited?: () => boolean }
 export interface StartOptions extends CredentialOptions {
   launch?: (specification: BackgroundLaunch) => Promise<LaunchedProcess>;
   timeoutMs?: number;
+  /** Automatic terminal return retains paused state and interrupted work. */
+  preserveRunState?: boolean;
 }
 
 export interface ProcessResult { message: string; alreadyRunning?: boolean; starting?: boolean; pid?: number }
@@ -177,24 +231,37 @@ export async function startGroup(cwd: string, options: StartOptions = {}): Promi
       const afterLock = await getProcessStatus(directory);
       if (afterLock.running || afterLock.starting) return { message: '本群 Pi 已运行或正在启动。', alreadyRunning: true, starting: afterLock.starting, pid: afterLock.pid ?? undefined };
       const launchId = randomUUID();
+      const startedAt = Date.now();
       const { env } = await resolveGroupEnvironment(directory, config, options);
+      const launchEnv: NodeJS.ProcessEnv = { ...env, PIQ_LAUNCH_ID: launchId, PIQ_RUN_MODE: 'background' };
+      if (options.preserveRunState) delete launchEnv.PIQ_START_RUNNING;
+      else launchEnv.PIQ_START_RUNNING = '1';
       const childProcess = await (options.launch ?? launchBackground)({
         command: globalThis.process.execPath,
         args: [fileURLToPath(new URL('./background.ts', import.meta.url)), directory],
         cwd: directory,
-        env: { ...env, PIQ_LAUNCH_ID: launchId, PIQ_RUN_MODE: 'background', PIQ_START_RUNNING: '1' },
+        env: launchEnv,
       });
+      if (!Number.isSafeInteger(childProcess.pid) || childProcess.pid <= 0) throw new Error('后台 Pi 没有返回有效进程标识。');
+      await savePendingLaunch(directory, { version: 1, launchId, pid: childProcess.pid, startedAt });
       const deadline = Date.now() + (options.timeoutMs ?? 8_000);
       do {
         const record = await worker(directory);
         const owner = await getRunningOwner(directory);
         if (record?.launchId === launchId) {
-          if (record.state === 'error') throw new Error('后台 Pi 启动失败，请检查本群模型配置与扩展。');
+          if (record.state === 'error' || record.state === 'stopped') {
+            await forgetPendingLaunch(directory, launchId);
+            throw new Error('后台 Pi 启动失败，请检查本群模型配置与扩展。');
+          }
           if (record.state === 'running' && owner.running && owner.pid === childProcess.pid && record.ownerToken === await ownerToken(directory)) {
+            await forgetPendingLaunch(directory, launchId);
             return { message: '本群 Pi 已在后台启动，并继续最近的会话。', pid: childProcess.pid };
           }
         }
-        if (childProcess.exited?.()) throw new Error('后台 Pi 在启动完成前退出，请检查本群配置。');
+        if (childProcess.exited?.()) {
+          await forgetPendingLaunch(directory, launchId);
+          throw new Error('后台 Pi 在启动完成前退出，请检查本群配置。');
+        }
         if (Date.now() >= deadline) break;
         await delay(100);
       } while (true);
@@ -219,7 +286,7 @@ export async function handoffToTerminal(cwd: string, options: HandoffOptions = {
       const expectedToken = await ownerToken(directory);
       const shutdown = options.shutdown ?? (async path => {
         const { requestRunAction } = await import('./run-control.ts');
-        return requestRunAction(path, 'shutdown');
+        return requestRunAction(path, 'handoff');
       });
       await shutdown(directory);
       const deadline = Date.now() + (options.timeoutMs ?? 8_000);

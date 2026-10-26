@@ -4,7 +4,7 @@ import { join, relative, isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseConversationKey } from './conversations.ts';
 
-export type RunAction = 'pause' | 'resume' | 'shutdown';
+export type RunAction = 'pause' | 'resume' | 'shutdown' | 'handoff';
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'error';
 export interface RuntimeStatus {
   pid: number;
@@ -39,7 +39,7 @@ async function read(cwd: string, filename: string): Promise<any> {
   } catch (error) { if (missing(error)) return null; throw error; }
 }
 
-async function write(cwd: string, filename: string, data: unknown): Promise<void> {
+async function write(cwd: string, filename: string, data: unknown, expectedOwner?: Owner): Promise<void> {
   const path = await pathFor(cwd, filename);
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
@@ -47,6 +47,10 @@ async function write(cwd: string, filename: string, data: unknown): Promise<void
     try { await handle.writeFile(JSON.stringify(data, null, 2) + '\n'); await handle.sync(); }
     finally { await handle.close(); }
     for (let attempt = 0; ; attempt++) {
+      if (expectedOwner) {
+        const current = await owner(cwd);
+        if (current?.token !== expectedOwner.token || current.pid !== expectedOwner.pid) return;
+      }
       try { await rename(temp, path); break; }
       catch (error) {
         if (process.platform !== 'win32' || attempt >= 5 || !['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
@@ -78,14 +82,22 @@ export async function readRuntimeStatus(cwd: string): Promise<RuntimeStatus | nu
 }
 
 export async function requestRunAction(cwd: string, action: RunAction): Promise<{ requestId: string }> {
-  if (!['pause', 'resume', 'shutdown'].includes(action)) throw new Error('未知运行操作。');
+  if (!['pause', 'resume', 'shutdown', 'handoff'].includes(action)) throw new Error('未知运行操作。');
   const lock = await owner(cwd);
   if (!lock) throw new Error('本群 Pi 当前未运行。');
   try { process.kill(lock.pid, 0); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw new Error('本群 Pi 已退出。'); }
   const requestId = randomUUID();
-  await write(cwd, 'run-request.json', { version: 1, requestId, targetPid: lock.pid, ownerToken: lock.token, action });
+  await write(cwd, 'run-request.json', { version: 1, requestId, targetPid: lock.pid, ownerToken: lock.token, action }, lock);
   return { requestId };
+}
+
+/** Stop can also cancel unfinished work after a terminal has already exited. */
+export async function clearInterruptedWork(cwd: string): Promise<void> {
+  const saved = await read(cwd, 'run-preferences.json');
+  if (saved === null) return;
+  if (saved.version !== 1 || typeof saved.paused !== 'boolean') throw new Error('本群暂停状态格式无效。');
+  await write(cwd, 'run-preferences.json', { version: 1, paused: saved.paused, interrupted: false });
 }
 
 export interface RunCallbacks {
@@ -102,6 +114,7 @@ export class RunController {
   paused = false;
   private interrupted = false;
   private closed = false;
+  private exiting = false;
   private lastRequest?: string;
   private lastSerialized = '';
   private timer?: ReturnType<typeof setInterval>;
@@ -126,7 +139,7 @@ export class RunController {
     if (process.env.PIQ_START_RUNNING === '1') {
       delete process.env.PIQ_START_RUNNING;
       controller.paused = false;
-      await write(cwd, 'run-preferences.json', { version: 1, paused: false, interrupted: controller.interrupted });
+      await write(cwd, 'run-preferences.json', { version: 1, paused: false, interrupted: controller.interrupted }, lock);
     }
     await controller.publish();
     controller.timer = setInterval(() => controller.refresh(), pollMs);
@@ -135,19 +148,47 @@ export class RunController {
     return controller;
   }
 
+  get needsResume(): boolean { return !this.paused && this.interrupted; }
+
+  /** Commit before a model turn starts, so an abrupt process exit leaves a restart point. */
+  markBusy(busy: boolean): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.paused || this.exiting || !await this.ownsGroup()) return;
+      this.interrupted = busy;
+      await this.savePreferences();
+    });
+  }
+
+  private async ownsGroup(): Promise<boolean> {
+    if (this.closed) return false;
+    const lock = await owner(this.cwd);
+    return !this.closed && lock?.token === this.lock.token && lock.pid === this.lock.pid;
+  }
+
+  private savePreferences(): Promise<void> {
+    return write(this.cwd, 'run-preferences.json', { version: 1, paused: this.paused, interrupted: this.interrupted }, this.lock);
+  }
+
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    const result = this.task.then(operation);
+    this.task = result.catch(error => { if (!this.closed) this.callbacks.error(error); });
+    return result;
+  }
+
   refresh(): void {
     if (this.closed || this.scheduled) return;
     this.scheduled = true;
-    this.task = this.task.then(async () => {
-      if (this.closed) return;
-      const lock = await owner(this.cwd);
-      if (this.closed || lock?.token !== this.lock.token) return;
+    void this.enqueue(async () => {
+      if (!await this.ownsGroup()) return;
       const request = await read(this.cwd, 'run-request.json');
       if (request?.version === 1 && request.targetPid === this.lock.pid && request.ownerToken === this.lock.token
         && typeof request.requestId === 'string' && request.requestId !== this.lastRequest
-        && ['pause', 'resume', 'shutdown'].includes(request.action)) {
+        && ['pause', 'resume', 'shutdown', 'handoff'].includes(request.action)) {
         this.lastRequest = request.requestId;
-        if (request.action === 'shutdown') {
+        if (request.action === 'shutdown' || request.action === 'handoff') {
+          this.exiting = true;
+          this.interrupted = request.action === 'handoff' && (this.interrupted || this.callbacks.isBusy());
+          await this.savePreferences();
           await this.publish();
           if (!this.closed) this.callbacks.shutdown();
           return;
@@ -155,18 +196,17 @@ export class RunController {
         if (request.action === 'pause') {
           this.interrupted ||= this.callbacks.isBusy();
           this.paused = true;
-          await write(this.cwd, 'run-preferences.json', { version: 1, paused: true, interrupted: this.interrupted });
+          await this.savePreferences();
           if (!this.closed) await this.callbacks.pause();
         } else {
           const interrupted = this.interrupted;
           this.paused = false;
-          this.interrupted = false;
-          await write(this.cwd, 'run-preferences.json', { version: 1, paused: false, interrupted: false });
+          await this.savePreferences();
           if (!this.closed) await this.callbacks.resume(interrupted);
         }
       }
       if (!this.closed) await this.publish();
-    }).catch(error => { if (!this.closed) this.callbacks.error(error); }).finally(() => { this.scheduled = false; });
+    }).catch(() => {}).finally(() => { this.scheduled = false; });
   }
 
   private async publish(): Promise<void> {
@@ -175,7 +215,7 @@ export class RunController {
       paused: this.paused, ...this.callbacks.snapshot(), requestId: this.lastRequest };
     const serialized = JSON.stringify(values);
     if (serialized === this.lastSerialized) return;
-    await write(this.cwd, 'runtime.json', { ...values, updatedAt: Date.now() });
+    await write(this.cwd, 'runtime.json', { ...values, updatedAt: Date.now() }, this.lock);
     this.lastSerialized = serialized;
   }
 

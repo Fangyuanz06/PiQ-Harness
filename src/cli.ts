@@ -89,7 +89,11 @@ export async function resolvePiCommand(env: NodeJS.ProcessEnv = process.env): Pr
   throw new Error("未找到 Pi 的 Node 入口。请安装 Pi，或用 PIQ_PI_ENTRY 指定其 JavaScript 入口文件。");
 }
 
-export async function openGroup(cwd: string, extraArgs: string[] = []): Promise<number> {
+export interface OpenGroupOptions {
+  onSpawn?: (pid: number) => void | Promise<void>;
+}
+
+export async function openGroup(cwd: string, extraArgs: string[] = [], options: OpenGroupOptions = {}): Promise<number> {
   const config = await loadConfig(cwd);
   if (!config) throw new Error("该对话组尚未初始化。请先运行 init <对话组标识> --name <名称>。");
   if (!config.conversations.length) throw new Error('请先向对话组添加至少一个对话。');
@@ -100,8 +104,16 @@ export async function openGroup(cwd: string, extraArgs: string[] = []): Promise<
     const child = spawn(launcher.command, [...launcher.args, "--continue", "--session-dir", join(cwd, ".pi", "sessions"), ...selectedModel, ...extraArgs], {
       cwd, stdio: "inherit", env: process.env, shell: false, windowsHide: true,
     });
-    child.on("error", reject);
-    child.on("exit", (code) => resolveCode(code ?? 1));
+    let registration: Promise<void> = Promise.resolve();
+    child.once('spawn', () => {
+      registration = Promise.resolve().then(async () => {
+        if (!child.pid) throw new Error('Pi 没有返回进程标识。');
+        await options.onSpawn?.(child.pid);
+      });
+      void registration.catch(error => { child.kill('SIGKILL'); reject(error); });
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => { void registration.then(() => resolveCode(code ?? 1), reject); });
   });
 }
 

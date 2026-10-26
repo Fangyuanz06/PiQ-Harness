@@ -10,7 +10,8 @@ import { conversationKey, conversationDirectory, parseConversationKey, type Conv
 import { credentialStatus, getRunningOwner, openGroupTerminal } from './web-terminal.ts';
 import { getModelPreference, listModels, saveModelPreference, type ModelCatalog } from './web-models.ts';
 import { readModelStatus, requestModelChange } from './model-control.ts';
-import { readRuntimeStatus, requestRunAction } from './run-control.ts';
+import { clearInterruptedWork, readRuntimeStatus, requestRunAction } from './run-control.ts';
+import { cancelTerminalReturn } from './terminal-monitor.ts';
 import { getProcessStatus, handoffToTerminal, startGroup } from './process-manager.ts';
 import { ensureSnowLuma, openSnowLumaManual, type SnowLumaServiceResult } from './snowluma-service.ts';
 import { parseStoredRecord } from './store.ts';
@@ -314,7 +315,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
           if ((launching.get(id) ?? 0) > Date.now()) { json(response, { alreadyRunning: true, message: '终端正在打开，请稍候。' }); return; }
           const service = await ensureService(cwd);
           const result = process.mode === 'background'
-            ? await handoffToTerminal(cwd, { openTerminal: launch, shutdown: path => action(path, 'shutdown') })
+            ? await handoffToTerminal(cwd, { openTerminal: launch, shutdown: path => action(path, 'handoff') })
             : await launch(cwd);
           launching.set(id, Date.now() + 10_000);
           json(response, { ...result, service });
@@ -340,7 +341,16 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
               json(response, { ...result, ...await action(cwd, 'resume'), message: '已请求恢复本群 Pi。' });
             } else json(response, result);
           } else if (parts[3] === 'stop') {
-            if (!(await getRunningOwner(cwd)).running) { json(response,{message:'对话组已停止。'}); return; }
+            await cancelTerminalReturn(cwd);
+            const startupDeadline = Date.now() + 10_000;
+            while (!(await getRunningOwner(cwd)).running && (await getProcessStatus(cwd)).starting) {
+              if (Date.now() >= startupDeadline) throw new HttpError(409, '后台仍在启动，尚未完成停止，请稍后重试。');
+              await delay(100);
+            }
+            if (!(await getRunningOwner(cwd)).running) {
+              await clearInterruptedWork(cwd);
+              json(response,{message:'对话组已停止。'}); return;
+            }
             const result = await action(cwd,'shutdown');
             const deadline = Date.now()+10_000;
             while ((await getRunningOwner(cwd)).running && Date.now()<deadline) await delay(100);

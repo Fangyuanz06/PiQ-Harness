@@ -63,7 +63,7 @@ async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }) {
     start: async path => { started.push(path); return { message: 'Started mock group' }; },
     action: async (path, action) => {
       actions.push(action);
-      if (action === 'shutdown') await unlink(join(path, '.piq', 'owner.lock'));
+      if (action === 'shutdown' || action === 'handoff') await unlink(join(path, '.piq', 'owner.lock'));
       return { requestId: `mock-${action}` };
     },
   });
@@ -408,6 +408,53 @@ test('empty groups can be created for setup, and stop releases a live owner befo
   assert.equal((await f.call('/api/groups/123456/config', 'PUT', {
     revision: detail.configRevision, config: { ...detail.config, conversations: [{ type: 'private', id: '999999' }] },
   })).status, 200);
+});
+
+test('stop cancels a pending terminal return even after the terminal owner has disappeared', async t => {
+  const f = await fixture(t);
+  const directory = join(f.cwd, '.piq');
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, 'terminal-return.json'), JSON.stringify({
+    version: 1, token: 'pending-terminal-return', launcherPid: process.pid, monitorPid: process.pid,
+    createdAt: Date.now(), state: 'watching',
+  }));
+  await writeFile(join(directory, 'run-preferences.json'), JSON.stringify({ version: 1, paused: true, interrupted: true }));
+  const response = await f.call('/api/groups/123456/stop', 'POST', {});
+  assert.equal(response.status, 200);
+  await assert.rejects(readFile(join(directory, 'terminal-return.json')), { code: 'ENOENT' });
+  assert.deepEqual(JSON.parse(await readFile(join(directory, 'run-preferences.json'), 'utf8')),
+    { version: 1, paused: true, interrupted: false });
+  assert.deepEqual(f.actions, []);
+});
+
+test('opening a background group uses a handoff rather than an explicit stop', async t => {
+  const f = await fixture(t);
+  const directory = join(f.cwd, '.piq');
+  await mkdir(directory, { recursive: true });
+  const token = 'handoff-owner';
+  await writeFile(join(directory, 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token }));
+  await writeFile(join(directory, 'worker.json'), JSON.stringify({ version: 1, mode: 'background', pid: process.pid,
+    launchId: 'test-launch', startedAt: Date.now(), state: 'running', ownerToken: token }));
+  const response = await f.call('/api/groups/123456/open', 'POST', {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(f.actions, ['handoff']);
+  assert.equal(f.launched.length, 1);
+});
+
+for (const startupFile of ['worker.json', 'worker-launch.json']) test(`stop waits through ${startupFile} before stopping its newly acquired owner`, async t => {
+  const f = await fixture(t);
+  const directory = join(f.cwd, '.piq');
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, startupFile), JSON.stringify({ version: 1, pid: process.pid,
+    launchId: 'test-starting', startedAt: Date.now(),
+    ...(startupFile === 'worker.json' ? { mode: 'background', state: 'starting' } : {}) }));
+  const stopping = f.call('/api/groups/123456/stop', 'POST', {});
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.deepEqual(f.actions, []);
+  await writeFile(join(directory, 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'late-owner' }));
+  assert.equal((await stopping).status, 200);
+  assert.deepEqual(f.actions, ['shutdown']);
+  await assert.rejects(readFile(join(directory, 'owner.lock')), { code: 'ENOENT' });
 });
 
 test('terminal requests are deduplicated and an existing group owner is respected', async t => {

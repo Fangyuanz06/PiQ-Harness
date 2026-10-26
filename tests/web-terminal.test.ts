@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { initializeGroup, validateConfig } from '../src/config.ts';
 import { credentialStatus, getRunningOwner, openGroupTerminal, resolveGroupEnvironment, type TerminalLaunch } from '../src/web-terminal.ts';
+import { terminalMain } from '../src/terminal-entry.ts';
+import { openGroup } from '../src/cli.ts';
 
 async function fixture() {
   const parent = fileURLToPath(new URL('../.test-tmp/', import.meta.url));
@@ -69,6 +72,8 @@ test('terminal request uses trusted scripts and separate arguments with a scoped
   const result = await openGroupTerminal(f.cwd, {
     configDirectory: f.configDirectory,
     env: { SystemRoot: 'C:\\Windows', PIQ_PI_ENTRY: fakeEntry },
+    prepareReturn: async () => ({ token: 'terminal-return-test-token' }),
+    cancelReturn: async () => {},
     launch: async specification => { request = specification; },
   });
   assert.match(result.message, /继续本群最近/);
@@ -77,11 +82,13 @@ test('terminal request uses trusted scripts and separate arguments with a scoped
   assert.equal(request!.env.SNOWLUMA_ACCESS_TOKEN, 'private-test-token');
   assert.equal(request!.env.PIQ_GROUP_DIRECTORY, f.cwd);
   assert.equal(request!.env.PIQ_NODE_EXECUTABLE, process.execPath);
+  assert.equal(request!.env.PIQ_TERMINAL_RETURN_TOKEN, 'terminal-return-test-token');
   assert.ok(request!.args.includes('-NoExit'));
   assert.ok(request!.args.includes('--inheritEnvironment'));
   assert.ok(!request!.args.includes(f.cwd));
   assert.ok(request!.args.some(arg => arg.endsWith(join('scripts', 'open-pi.ps1'))));
   assert.equal(request!.args.some(arg => arg.includes('Start-Pi.ps1') || arg.includes('private-test-token')), false);
+  assert.equal(request!.args.some(arg => arg.includes('terminal-return-test-token')), false);
 });
 
 test('an existing live group owner prevents a duplicate terminal', async t => {
@@ -104,7 +111,7 @@ test('the trusted terminal entry continues the correct group session without a m
   await writeFile(fakeEntry, 'console.log(JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2), credential: !!process.env.SNOWLUMA_ACCESS_TOKEN }));');
   const output = await new Promise<string>((resolveOutput, reject) => {
     const child = spawn(process.execPath, [fileURLToPath(new URL('../src/terminal-entry.ts', import.meta.url)), f.cwd], {
-      cwd: f.root, env: { ...process.env, PIQ_PI_ENTRY: fakeEntry, SNOWLUMA_ACCESS_TOKEN: 'test-only' }, shell: false, windowsHide: true,
+      cwd: f.root, env: { ...process.env, PIQ_PI_ENTRY: fakeEntry, SNOWLUMA_ACCESS_TOKEN: 'test-only', PIQ_TERMINAL_RETURN_TOKEN: undefined }, shell: false, windowsHide: true,
     });
     let text = ''; let errors = '';
     child.stdout.on('data', chunk => { text += chunk; });
@@ -126,11 +133,13 @@ test('the PowerShell helper treats special characters in group paths as literal 
   let output = '';
   await openGroupTerminal(cwd, {
     configDirectory: f.configDirectory, env: { ...process.env, PIQ_PI_ENTRY: fakeEntry, SNOWLUMA_ACCESS_TOKEN: 'test-helper' },
+    prepareReturn: async () => ({ token: 'helper-return-token' }),
+    cancelReturn: async () => {},
     launch: specification => new Promise<void>((resolveLaunch, reject) => {
       const helper = specification.args[specification.args.indexOf('-File') + 1]!;
       const shell = specification.args[specification.args.indexOf('-NoLogo') - 1]!;
       const child = spawn(shell, ['-NoLogo', '-NoProfile', '-File', helper], {
-        cwd: f.root, env: specification.env, shell: false, windowsHide: true,
+        cwd: f.root, env: { ...specification.env, PIQ_TERMINAL_RETURN_TOKEN: undefined }, shell: false, windowsHide: true,
       });
       let errors = '';
       child.stdout.on('data', chunk => { output += chunk; });
@@ -142,4 +151,99 @@ test('the PowerShell helper treats special characters in group paths as literal 
   assert.deepEqual(JSON.parse(output), {
     cwd, args: ['--continue', '--session-dir', join(cwd, '.pi', 'sessions')], credential: true,
   });
+});
+
+test('concurrent and still-opening terminal requests launch one window', async t => {
+  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const fakeEntry = join(f.root, 'fake-pi.cjs'); await writeFile(fakeEntry, '');
+  let preparations = 0; let launches = 0;
+  const options = {
+    env: { PIQ_PI_ENTRY: fakeEntry, SNOWLUMA_ACCESS_TOKEN: 'test-only' },
+    prepareReturn: async () => ({ token: 'opening-return-token', alreadyRunning: preparations++ > 0 }),
+    cancelReturn: async () => assert.fail('Successful opening must retain its return lease'),
+    launch: async () => { launches++; await delay(20); },
+  };
+  const results = await Promise.all([openGroupTerminal(f.cwd, options), openGroupTerminal(f.cwd, options)]);
+  assert.equal(launches, 1);
+  assert.equal(preparations, 1);
+  assert.equal(results.filter(result => result.alreadyRunning).length, 1);
+  assert.equal((await openGroupTerminal(f.cwd, options)).alreadyRunning, true);
+  assert.equal(launches, 1);
+});
+
+test('a failed window launch cancels only the prepared terminal lease', async t => {
+  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const fakeEntry = join(f.root, 'fake-pi.cjs'); await writeFile(fakeEntry, '');
+  const cancelled: unknown[] = [];
+  await assert.rejects(openGroupTerminal(f.cwd, {
+    env: { PIQ_PI_ENTRY: fakeEntry, SNOWLUMA_ACCESS_TOKEN: 'test-only' },
+    prepareReturn: async () => ({ token: 'failed-window-token' }),
+    cancelReturn: async (...args: [string, string?]) => { cancelled.push(args); },
+    launch: async () => { throw new Error('fixture window failure'); },
+  }), /fixture window failure/);
+  assert.deepEqual(cancelled, [[f.cwd, 'failed-window-token']]);
+});
+
+test('an owner appearing after lease preparation prevents the terminal window', async t => {
+  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const fakeEntry = join(f.root, 'fake-pi.cjs'); await writeFile(fakeEntry, '');
+  const cancelled: unknown[] = [];
+  const result = await openGroupTerminal(f.cwd, {
+    env: { PIQ_PI_ENTRY: fakeEntry, SNOWLUMA_ACCESS_TOKEN: 'test-only' },
+    prepareReturn: async () => {
+      await mkdir(join(f.cwd, '.piq'));
+      await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'new-owner' }));
+      return { token: 'superseded-return-token' };
+    },
+    cancelReturn: async (...args: [string, string?]) => { cancelled.push(args); },
+    launch: async () => assert.fail('A new live owner must prevent the terminal launch'),
+  });
+  assert.equal(result.alreadyRunning, true);
+  assert.deepEqual(cancelled, [[f.cwd, 'superseded-return-token']]);
+  assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'owner.lock'), 'utf8')).token, 'new-owner');
+});
+
+test('managed terminal entries register wrapper and Pi child while plain entries do not', async () => {
+  const cwd = join(process.cwd(), '.test-tmp', 'entry-fixture');
+  const calls: unknown[] = [];
+  const result = await terminalMain([cwd], {
+    env: { PIQ_TERMINAL_RETURN_TOKEN: 'managed-entry-token' },
+    register: async (...args: [string, string, number?, number?]) => { calls.push(args); },
+    open: async (path, args, options) => {
+      assert.equal(path, cwd); assert.deepEqual(args, []);
+      await options!.onSpawn!(123456);
+      return 0;
+    },
+  });
+  assert.equal(result, 0);
+  assert.deepEqual(calls, [[cwd, 'managed-entry-token', process.pid], [cwd, 'managed-entry-token', process.pid, 123456]]);
+  assert.equal(await terminalMain([cwd], { env: {}, register: async () => assert.fail('Plain CLI must not register a monitor'), open: async (_cwd, _args, options) => {
+    assert.equal(options, undefined); return 0;
+  } }), 0);
+  await assert.rejects(terminalMain([cwd], {
+    env: { PIQ_TERMINAL_RETURN_TOKEN: 'cancelled-entry-token' },
+    register: async () => { throw new Error('fixture stale terminal token'); },
+    open: async () => assert.fail('An invalid wrapper registration must not launch Pi'),
+  }), /fixture stale terminal token/);
+});
+
+test('Pi spawn registration finishes before an exiting child resolves and failures terminate the child', async t => {
+  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const previousEntry = process.env.PIQ_PI_ENTRY;
+  t.after(() => { if (previousEntry === undefined) delete process.env.PIQ_PI_ENTRY; else process.env.PIQ_PI_ENTRY = previousEntry; });
+  const fakeEntry = join(f.root, 'fast-pi.cjs'); await writeFile(fakeEntry, '');
+  process.env.PIQ_PI_ENTRY = fakeEntry;
+  let registered = false;
+  assert.equal(await openGroup(f.cwd, [], { onSpawn: async () => { await delay(40); registered = true; } }), 0);
+  assert.equal(registered, true);
+  await writeFile(fakeEntry, 'setInterval(() => {}, 1000)');
+  let childPid = 0;
+  await assert.rejects(openGroup(f.cwd, [], { onSpawn: async pid => { childPid = pid; throw new Error('fixture registration failed'); } }), /fixture registration failed/);
+  const deadline = Date.now() + 3_000;
+  while (true) {
+    try { process.kill(childPid, 0); }
+    catch (error) { assert.equal((error as NodeJS.ErrnoException).code, 'ESRCH'); break; }
+    if (Date.now() > deadline) assert.fail('The unregistered Pi child is still running');
+    await delay(10);
+  }
 });
