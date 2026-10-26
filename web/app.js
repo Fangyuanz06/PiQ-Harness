@@ -8,7 +8,8 @@ const state = {
   membershipSaved: '', membershipLoaded: false, membershipOutdated: false, configLoading: false, logConversation: '',
   models: null, modelCatalogError: '', modelSaved: '', modelRevision: '', modelLoaded: false, modelSequence: 0,
   modelRuntime: null, modelPendingRequestId: null, modelAwaitStarted: 0, modelAwaitTimedOut: false, modelRuntimeLoading: false,
-  busy: false, loadingState: false, poll: null,
+  busy: false, loadingState: false, poll: null, groupPending: new Map(),
+  slangEntries: [], slangConversations: [], slangSequence: 0, slangLoading: false,
   runPending: new Map(), runPoll: null, terminalPending: new Set(),
   serviceCache: new Map(), servicePending: new Map(),
 };
@@ -40,11 +41,13 @@ const documentUrl = (filename, id = state.selected) => filename === 'ROOT_AGENTS
   ? '/api/root/agents' : `${groupUrl(id)}/documents/${encodeURIComponent(filename)}`;
 const documentLabel = filename => filename === 'ROOT_AGENTS.md' ? '公共 AGENTS.md' : filename === 'AGENTS.md' ? '本对话组 AGENTS.md' : filename;
 function documentDirty() { return state.documentLoaded && $('document-content').value !== state.documentText; }
+const permissionKeys = ['commands', 'fileRead', 'fileWrite', 'qq', 'network', 'otherTools'];
+const permissionFields = () => Object.fromEntries(permissionKeys.map(key => [key, $('permission-' + key).checked]));
 function connectionFields() {
   return {
     wsUrl: $('ws-url').value.trim(), accessTokenEnv: $('token-env').value.trim(),
     quietMs: Number($('quiet-ms').value), maxWaitMs: Number($('max-wait-ms').value),
-    minIntervalMs: Number($('min-interval-ms').value),
+    minIntervalMs: Number($('min-interval-ms').value), permissions: permissionFields(),
   };
 }
 function configValue() { return { ...state.detail?.config, ...connectionFields() }; }
@@ -271,6 +274,148 @@ function renderRunStatus() {
   $('open-snowluma').title = cannotOpenManual ? service.diagnostic || service.message || '此连接没有可打开的本机界面，请检查 SnowLuma 安装或远端服务。' : '打开 SnowLuma 界面或启动窗口，查看登录和运行情况';
   if (current?.name) $('group-title').textContent = current.name;
   updateMembershipState();
+  renderGroupManagement();
+}
+
+
+function renderGroupManagement() {
+  const pending = state.groupPending.has(state.selected), stopped = !membershipLocked();
+  $('rename-group').disabled = !state.detail || pending || state.busy || state.configLoading;
+  $('copy-group').disabled = !state.detail || pending || state.busy || !stopped;
+  $('delete-group').disabled = !state.detail || pending || state.busy || !stopped;
+  $('group-menu-help').textContent = pending ? '正在处理，请稍候…' : stopped
+    ? '复制不带对话成员；删除后数据移到 .trash，可恢复。' : '本组 Pi 正在运行。复制和删除前请先停止；可直接重命名。';
+  if (pending) { $('run-action').disabled = true; $('open-terminal').disabled = true; $('stop-run').disabled = true; }
+}
+function validGroupName(value) {
+  const name = value.trim();
+  if (!name || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) throw new Error('名称须为 1 到 80 个字符，且不含控制字符。');
+  return name;
+}
+function clearGroupSelection() {
+  state.selected = null; state.detail = null; state.detailSequence++;
+  state.documentSequence++; state.logSequence++; state.modelSequence++; state.slangSequence++;
+  state.documentLoaded = false; state.membershipLoaded = false; state.modelLoaded = false;
+  state.slangEntries = []; state.slangConversations = []; state.slangLoading = false;
+  $('document-content').value = ''; $('group-workspace').hidden = true; $('welcome').hidden = false;
+  $('group-menu').open = false;
+  try { localStorage.removeItem('piq:selected-group'); } catch { /* Storage is optional. */ }
+}
+async function manageGroup(action) {
+  const id = state.selected, detail = state.detail, sequence = state.detailSequence;
+  if (!id || !detail || state.groupPending.has(id) || state.busy) return;
+  if (action !== 'rename' && membershipLocked()) { notice('请先停止本组 Pi，再复制或删除对话组。', true); return; }
+  if ((membershipDirty() || configDirty()) && action === 'rename') { notice('请先保存或重新读取当前设置，再重命名。', true); return; }
+  let name;
+  if (action === 'rename' || action === 'copy') {
+    const requested = window.prompt(action === 'rename' ? '对话组新名称' : '新副本的名称（对话成员将留空）', action === 'rename' ? detail.config.name : (detail.config.name.slice(0, 77) + ' 副本'));
+    if (requested === null) return;
+    try { name = validGroupName(requested); } catch (error) { notice(error.message, true); return; }
+    if (action === 'rename' && name === detail.config.name) return;
+  } else if (action === 'delete') {
+    if (!mayDiscard() || !window.confirm('删除对话组“' + detail.config.name + '”？\n\n它会从工作台移除，数据移到根目录的 .trash 中，可手动恢复。此操作不会删除 QQ 群。')) return;
+  } else return;
+  $('group-menu').open = false;
+  state.groupPending.set(id, action); renderRunStatus();
+  try {
+    if (action === 'rename') {
+      const result = await api(groupUrl(id) + '/config', { method: 'PUT', body: { config: { ...detail.config, name }, revision: state.configRevision } });
+      const group = state.groups.find(item => item.id === id); if (group) group.name = result.config.name;
+      if (id === state.selected && sequence === state.detailSequence) {
+        state.detail.config = result.config; state.detail.configRevision = result.revision; state.configRevision = result.revision;
+        $('group-name').value = result.config.name; state.membershipSaved = JSON.stringify(membershipValue());
+        notice('对话组已重命名为“' + result.config.name + '”。');
+      }
+      renderGroups();
+    } else if (action === 'copy') {
+      const result = await api(groupUrl(id) + '/copy', { method: 'POST', body: { name } });
+      await refreshState();
+      if (id === state.selected && sequence === state.detailSequence && mayDiscard()) await selectGroup(result.id, true);
+      notice('已创建副本“' + (result.name || name) + '”。请先在“对话”页添加成员，再启动 Pi。');
+    } else {
+      const result = await api(groupUrl(id), { method: 'DELETE' });
+      state.groups = state.groups.filter(group => group.id !== id);
+      state.serviceCache.delete(id); state.runPending.delete(id);
+      if (id === state.selected) {
+        clearGroupSelection();
+        const next = state.groups[0]?.id;
+        if (next) await selectGroup(next, true);
+      }
+      renderGroups();
+      await refreshState();
+      notice('对话组已移入可恢复目录：' + (result.recoveryPath || '.trash') + '。');
+    }
+  } catch (error) {
+    if (id === state.selected && sequence === state.detailSequence) notice(error.message, true);
+  } finally { state.groupPending.delete(id); renderRunStatus(); }
+}
+
+function normalizedSlang(value) { return String(value || '').normalize('NFKC').trim().toLocaleLowerCase(); }
+function filteredSlang(entries, query, status) {
+  const needle = normalizedSlang(query);
+  return entries.filter(entry => (status === 'all' || entry.status === status)
+    && (!needle || normalizedSlang([entry.term, entry.meaning, entry.usage].join(' ')).includes(needle)));
+}
+function safeSlangSource(value) {
+  try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.href : null; }
+  catch { return null; }
+}
+function renderSlang() {
+  const list = $('slang-list'); list.replaceChildren();
+  const entries = filteredSlang(state.slangEntries, $('slang-search').value, $('slang-status').value || 'all');
+  $('slang-count').textContent = state.slangLoading ? '正在读取…' : entries.length + ' / ' + state.slangEntries.length + ' 个词条';
+  $('slang-empty').hidden = state.slangLoading ? false : !!entries.length;
+  $('slang-empty-title').textContent = state.slangLoading ? '正在读取梗与黑话…' : !$('slang-error').hidden ? '词库读取失败' : state.slangEntries.length ? '没有符合条件的词条' : '还没有梗与黑话';
+  $('slang-empty-help').textContent = state.slangLoading ? '正在读取本组词库。' : !$('slang-error').hidden ? '请检查上方原因，再点击刷新词库重试。' : state.slangEntries.length ? '试试其他关键词或状态。' : 'Agent 会在处理聊天时自主学习，可随时刷新查看。';
+  list.hidden = !entries.length;
+  const known = new Map(state.slangConversations.map(item => [conversationKey(item), item]));
+  const statuses = { candidate: '候选', learned: '已学用法', rejected: '已忽略' };
+  for (const entry of entries) {
+    const article = document.createElement('article'); article.className = 'slang-entry';
+    const heading = document.createElement('div'); heading.className = 'slang-entry-heading';
+    const title = document.createElement('h3'); title.textContent = String(entry.term || '未命名词条');
+    const status = document.createElement('span'); status.className = 'slang-badge ' + (Object.hasOwn(statuses, entry.status) ? entry.status : 'candidate'); status.textContent = statuses[entry.status] || '候选';
+    heading.append(title, status); article.append(heading);
+    const fields = document.createElement('dl'); fields.className = 'slang-fields';
+    for (const [label, value] of [['含义 · 模型推断', entry.meaning], ['使用场景', entry.usage], ['例句', entry.example], ['注意事项', entry.cautions]]) {
+      if (!value) continue;
+      const key = document.createElement('dt'); key.textContent = label;
+      const text = document.createElement('dd'); text.textContent = String(value); fields.append(key, text);
+    }
+    if (!entry.meaning && !entry.usage) { const text = document.createElement('p'); text.className = 'slang-unresolved'; text.textContent = '含义与场景尚不明确，等待更多聊天语境。'; article.append(text); }
+    article.append(fields);
+    const meta = document.createElement('div'); meta.className = 'slang-meta';
+    const source = document.createElement('span'); const conversation = known.get(entry.conversation) || conversationFromKey(entry.conversation);
+    source.textContent = '来源：' + (conversation ? conversationLabel(conversation) : String(entry.conversation || '历史来源'));
+    const evidence = document.createElement('span'); evidence.textContent = (Array.isArray(entry.evidenceSeqs) ? entry.evidenceSeqs.length : 0) + ' 条聊天证据';
+    const time = document.createElement('time'); const date = new Date(entry.updatedAt); time.textContent = Number.isFinite(date.getTime()) ? '更新于 ' + date.toLocaleString('zh-CN', { hour12: false }) : '';
+    meta.append(source, evidence, time); article.append(meta);
+    if (Array.isArray(entry.sources)) {
+      const links = document.createElement('div'); links.className = 'slang-sources';
+      for (const item of entry.sources) {
+        const href = safeSlangSource(item?.url); if (!href) continue;
+        const link = document.createElement('a'); link.href = href; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = String(item.title || '联网来源'); links.append(link);
+      }
+      if (links.children.length) article.append(links);
+    }
+    list.append(article);
+  }
+}
+async function loadSlang() {
+  const id = state.selected, sequence = ++state.slangSequence;
+  if (!id || !state.detail) return;
+  state.slangLoading = true; state.slangEntries = []; $('refresh-slang').disabled = true; $('slang-error').hidden = true; renderSlang();
+  try {
+    const result = await api(groupUrl(id) + '/slang');
+    if (id !== state.selected || sequence !== state.slangSequence) return;
+    if (!Array.isArray(result.entries) || !Array.isArray(result.conversations)) throw new Error('词库返回格式无效，请刷新后重试。');
+    state.slangEntries = result.entries; state.slangConversations = result.conversations;
+  } catch (error) {
+    if (id !== state.selected || sequence !== state.slangSequence) return;
+    $('slang-error').textContent = error.message; $('slang-error').hidden = false;
+  } finally {
+    if (id === state.selected && sequence === state.slangSequence) { state.slangLoading = false; $('refresh-slang').disabled = false; renderSlang(); }
+  }
 }
 
 function rememberService(id, result) {
@@ -399,7 +544,10 @@ async function selectGroup(id, force = false) {
   if (state.selected === id && state.detail) return;
   if (!force && !mayDiscard()) return;
   const sequence = ++state.detailSequence;
-  state.documentSequence++; state.logSequence++; state.modelSequence++;
+  state.documentSequence++; state.logSequence++; state.modelSequence++; state.slangSequence++;
+  state.slangEntries = []; state.slangConversations = []; state.slangLoading = false;
+  $('slang-search').value = ''; $('slang-status').value = 'all'; $('slang-error').hidden = true; renderSlang();
+  $('group-menu').open = false;
   state.selected = id; state.detail = null; state.documentLoaded = false; state.modelLoaded = false;
   state.membershipLoaded = false; state.membershipOutdated = false; state.configLoading = false; state.logConversation = '';
   state.modelRuntime = null; state.modelPendingRequestId = null; state.modelAwaitTimedOut = false;
@@ -428,6 +576,7 @@ async function selectGroup(id, force = false) {
     setLogOptions(detail.logs || {});
     await loadDocument(state.document, true);
     if (state.tab === 'messages') await loadLog();
+    if (state.tab === 'slang') await loadSlang();
     if (state.tab === 'model') await loadModel();
   } catch (error) {
     if (sequence === state.detailSequence) { notice(error.message, true); $('document-state').textContent = '读取失败'; }
@@ -439,6 +588,7 @@ function setConfig(detail) {
   $('ws-url').value = config.wsUrl; $('token-env').value = config.accessTokenEnv;
   $('quiet-ms').value = config.quietMs; $('max-wait-ms').value = config.maxWaitMs; $('min-interval-ms').value = config.minIntervalMs;
   document.querySelectorAll('#connection-form input').forEach(input => { input.disabled = false; });
+  for (const key of permissionKeys) $('permission-' + key).checked = config.permissions?.[key] !== false;
   state.configRevision = detail.configRevision || '';
   state.configText = JSON.stringify(connectionFields());
   $('group-name').value = config.name;
@@ -539,9 +689,9 @@ async function saveConfig(event) {
     if (id === state.selected && sequence === state.detailSequence) {
       state.detail.config = result.config;
       state.configText = JSON.stringify({ wsUrl: config.wsUrl, accessTokenEnv: config.accessTokenEnv,
-        quietMs: config.quietMs, maxWaitMs: config.maxWaitMs, minIntervalMs: config.minIntervalMs });
-      state.configRevision = result.revision;
-      notice('设置已保存。重启本对话组 Pi 或执行 /reload 后生效。');
+        quietMs: config.quietMs, maxWaitMs: config.maxWaitMs, minIntervalMs: config.minIntervalMs, permissions: config.permissions });
+      state.configRevision = result.revision; state.detail.configRevision = result.revision;
+      notice('设置已保存。功能权限立即生效；连接与聚合设置在重启或 /reload 后生效。');
     }
   } catch (error) {
     if (id === state.selected && sequence === state.detailSequence) {
@@ -568,7 +718,7 @@ async function saveMembership(event) {
     const result = await api(`${groupUrl(id)}/config`, { method: 'PUT', body: { config, revision: state.configRevision } });
     if (id === state.selected && sequence === state.detailSequence) {
       state.detail.config = result.config;
-      state.configRevision = result.revision;
+      state.configRevision = result.revision; state.detail.configRevision = result.revision;
       $('group-name').value = result.config.name;
       $('conversation-rows').replaceChildren();
       for (const conversation of result.config.conversations) addConversationRow('conversation-rows', conversation);
@@ -594,8 +744,9 @@ function setTab(tab) {
     const active = button.dataset.tab === tab;
     button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1;
   });
-  for (const name of ['conversations', 'documents', 'messages', 'model', 'connection']) $(`panel-${name}`).hidden = name !== tab;
+  for (const name of ['conversations', 'documents', 'messages', 'slang', 'model', 'connection']) $(`panel-${name}`).hidden = name !== tab;
   if (tab === 'messages' && state.detail) void refreshLogs();
+  if (tab === 'slang' && state.detail) void loadSlang();
   if (tab === 'model' && state.detail && !state.modelLoaded) void loadModel();
   else if (tab === 'model' && state.modelLoaded) void refreshModelRuntime();
 }
@@ -927,6 +1078,13 @@ async function addGroup(event) {
   } catch (error) { $('add-error').textContent = error.message; $('add-error').hidden = false; }
   finally { $('confirm-add').disabled = false; }
 }
+
+$('rename-group').addEventListener('click', () => manageGroup('rename'));
+$('copy-group').addEventListener('click', () => manageGroup('copy'));
+$('delete-group').addEventListener('click', () => manageGroup('delete'));
+$('refresh-slang').addEventListener('click', loadSlang);
+$('slang-search').addEventListener('input', renderSlang);
+$('slang-status').addEventListener('change', renderSlang);
 
 $('document-content').addEventListener('input', () => updateDocumentState());
 $('save-document').addEventListener('click', saveDocument);

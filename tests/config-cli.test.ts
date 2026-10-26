@@ -105,3 +105,14 @@ test('CLI starts the shared session through Node with literal arguments', async 
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(await readFile(output, 'utf8')), { cwd, args: ['--continue', '--session-dir', join(cwd, '.pi', 'sessions'), '--model', 'test/model', literal] });
 }));
+
+test('slang settings default to chat learning with explicit opt-in networking', () => {
+  assert.equal(validateConfig(minimal).slang, undefined);
+  assert.deepEqual(validateConfig({ ...minimal, slang: {} }).slang, { enabled: true, webResearch: false });
+  assert.deepEqual(validateConfig({ ...minimal, slang: { webResearch: true } }).slang, { enabled: true, webResearch: true });
+  assert.deepEqual(validateConfig({ ...minimal, slang: { enabled: false } }).slang, { enabled: false, webResearch: false });
+  assert.deepEqual(validateConfig({ ...minimal, slang: { autoMigrate: true } }).slang, { enabled: true, webResearch: false, autoMigrate: true });
+  for (const slang of [null, [], true, { enabled: 'false' }, { webResearch: 1 }, { provider: 'other' }, { autoMigrate: 1 }]) {
+    assert.throws(() => validateConfig({ ...minimal, slang }), /slang/);
+  }
+});

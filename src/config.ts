@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -14,6 +14,8 @@ export interface GroupConfig {
   quietMs: number;
   maxWaitMs: number;
   minIntervalMs: number;
+  slang?: { enabled: boolean; webResearch: boolean; autoMigrate?: boolean };
+  permissions?: { commands?: boolean; fileRead?: boolean; fileWrite?: boolean; qq?: boolean; network?: boolean; otherTools?: boolean };
 }
 
 export const DEFAULTS: Omit<GroupConfig, 'id' | 'name' | 'conversations'> = {
@@ -39,7 +41,7 @@ export function validateGroupId(value: unknown): string {
 
 export function validateConfig(value: unknown): GroupConfig {
   if (!object(value)) throw new Error('PIQ.md 的 JSON 必须是配置对象。');
-  const allowed = new Set(['id', 'name', 'conversations', ...Object.keys(DEFAULTS)]);
+  const allowed = new Set(['id', 'name', 'conversations', 'slang', 'permissions', ...Object.keys(DEFAULTS)]);
   if (Object.keys(value).some(key => !allowed.has(key))) throw new Error('PIQ.md 含未知配置项；请使用对话组配置格式。');
   const id = validateGroupId(value.id);
   if (typeof value.name !== 'string' || !value.name.trim() || value.name.trim().length > 80
@@ -47,7 +49,24 @@ export function validateConfig(value: unknown): GroupConfig {
   if (!Array.isArray(value.conversations)) throw new Error('conversations 必须是对话数组。');
   const conversations = value.conversations.map(validateConversation);
   if (new Set(conversations.map(conversationKey)).size !== conversations.length) throw new Error('同一对话在对话组中只能出现一次。');
-  const merged = { ...DEFAULTS, ...value };
+  let slang: GroupConfig['slang'];
+  if (value.slang !== undefined) {
+    if (!object(value.slang) || Object.keys(value.slang).some(key => !['enabled', 'webResearch', 'autoMigrate'].includes(key))
+      || ['enabled', 'webResearch', 'autoMigrate'].some(key => value.slang && object(value.slang) && value.slang[key] !== undefined && typeof value.slang[key] !== 'boolean')) {
+      throw new Error('slang 仅支持布尔配置 enabled、webResearch 和 autoMigrate。');
+    }
+    slang = { enabled: value.slang.enabled !== false, webResearch: value.slang.webResearch === true,
+      ...(value.slang.autoMigrate === undefined ? {} : { autoMigrate: value.slang.autoMigrate === true }) };
+  }
+  let permissions: GroupConfig['permissions'];
+  if (value.permissions !== undefined) {
+    const allowedPermissions = ['commands', 'fileRead', 'fileWrite', 'qq', 'network', 'otherTools'];
+    if (!object(value.permissions) || Object.keys(value.permissions).some(key => !allowedPermissions.includes(key))
+      || Object.values(value.permissions).some(setting => typeof setting !== 'boolean')) {
+      throw new Error('permissions 仅支持 commands、fileRead、fileWrite、qq、network、otherTools 布尔开关。');
+    }
+    permissions = { ...value.permissions };
+  }  const merged = { ...DEFAULTS, ...value };
   if (typeof merged.wsUrl !== 'string') throw new Error('wsUrl 必须是 WebSocket 地址。');
   let url: URL;
   try { url = new URL(merged.wsUrl); } catch { throw new Error('wsUrl 必须是有效的 ws:// 或 wss:// 地址。'); }
@@ -59,7 +78,8 @@ export function validateConfig(value: unknown): GroupConfig {
   }
   if (merged.maxWaitMs === 0 || merged.quietMs > merged.maxWaitMs) throw new Error('maxWaitMs 必须大于 0，且不小于 quietMs。');
   return { id, name: value.name.trim(), conversations, wsUrl: merged.wsUrl, accessTokenEnv: merged.accessTokenEnv,
-    quietMs: merged.quietMs, maxWaitMs: merged.maxWaitMs, minIntervalMs: merged.minIntervalMs };
+    quietMs: merged.quietMs, maxWaitMs: merged.maxWaitMs, minIntervalMs: merged.minIntervalMs,
+    ...(slang === undefined ? {} : { slang }), ...(permissions === undefined ? {} : { permissions }) };
 }
 
 function parseMarkdown(markdown: string): GroupConfig {
@@ -406,5 +426,214 @@ export async function adoptTemporaryConversation(cwd: string, input: Conversatio
       throw error;
     }
     return candidate;
+  });
+}
+
+function sameLocalPath(left: string, right: string): boolean {
+  return process.platform === 'win32' ? resolve(left).toLowerCase() === resolve(right).toLowerCase() : resolve(left) === resolve(right);
+}
+
+async function ordinaryGroupPath(path: string, directory: boolean): Promise<void> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink() || !sameLocalPath(path, await realpath(path))
+    || (directory ? !info.isDirectory() : !info.isFile())) {
+    throw new ConfigError(400, '对话组操作只接受普通目录和文件，不能通过符号链接或目录联接访问。');
+  }
+}
+
+interface StoppedGroup {
+  root: string;
+  path: string;
+  id: string;
+  config: GroupConfig;
+  relocated(path: string): void;
+}
+
+/** The same launch/owner leases used by Pi also protect stopped-group operations. */
+async function withStoppedGroup<T>(cwd: string, operation: (group: StoppedGroup) => Promise<T>): Promise<T> {
+  const requested = resolve(cwd);
+  const id = validateGroupId(basename(requested));
+  const requestedRoot = dirname(requested);
+  await ordinaryGroupPath(requestedRoot, true);
+  return withRootLock(requestedRoot, async root => {
+    await ordinaryGroupPath(requested, true);
+    const checked = await groupDirectory(requested);
+    if (checked.id !== id || !sameLocalPath(checked.root, root)) throw new ConfigError(400, '对话组必须直接位于当前根目录中。');
+    await ordinaryGroupPath(join(checked.path, 'PIQ.md'), false);
+    const config = await loadConfig(checked.path);
+    if (!config || config.id !== id) throw new ConfigError(400, '目录与 PIQ.md 的对话组标识不一致。');
+    const runtimeDirectory = join(checked.path, '.piq');
+    try { await ordinaryGroupPath(runtimeDirectory, true); }
+    catch (error) { if (!missing(error)) throw error; await mkdir(runtimeDirectory); }
+    for (const file of ['owner.lock', 'start.lock', 'start.lock.recover', 'recovery.lock', 'terminal-return.lock', 'terminal-return.lock.recover']) {
+      try { await ordinaryGroupPath(join(runtimeDirectory, file), false); }
+      catch (error) { if (missing(error)) continue; throw error; }
+      throw new ConfigError(409, '对话组正在运行、启动或保留运行锁；请先停止会话，确认残留锁已处理后重试。');
+    }
+    let workerState: { launchId: string; startedAt: number; state: string } | undefined;
+    try {
+      const workerPath = join(runtimeDirectory, 'worker.json');
+      await ordinaryGroupPath(workerPath, false);
+      if ((await lstat(workerPath)).size > 16_384) throw new Error();
+      const worker: unknown = JSON.parse(await readFile(workerPath, 'utf8'));
+      if (!object(worker) || worker.version !== 1 || worker.mode !== 'background' || !Number.isSafeInteger(worker.pid)
+        || Number(worker.pid) < 1 || typeof worker.launchId !== 'string' || !Number.isFinite(worker.startedAt)
+        || !['starting', 'running', 'stopped', 'error'].includes(String(worker.state))) throw new Error();
+      workerState = { launchId: worker.launchId, startedAt: worker.startedAt as number, state: String(worker.state) };
+      if (['starting', 'running'].includes(String(worker.state)) && alive(Number(worker.pid))) throw new ConfigError(409, '对话组正在运行或启动，请先停止后重试。');
+    } catch (error) {
+      if (error instanceof ConfigError) throw error;
+      if (!missing(error)) throw new ConfigError(409, '后台运行记录无效，请先检查 .piq/worker.json。');
+    }
+    for (const file of ['worker-launch.json', 'launch.json']) {
+      try {
+        const launchPath = join(runtimeDirectory, file);
+        await ordinaryGroupPath(launchPath, false);
+        if ((await lstat(launchPath)).size > 16_384) throw new Error();
+        const launch: unknown = JSON.parse(await readFile(launchPath, 'utf8'));
+        if (!object(launch) || launch.version !== 1 || !Number.isSafeInteger(launch.pid) || Number(launch.pid) < 1
+          || typeof launch.launchId !== 'string' || !launch.launchId || typeof launch.startedAt !== 'number'
+          || !Number.isFinite(launch.startedAt) || launch.startedAt < 0) throw new Error();
+        // A matching child state, or a later worker, supersedes its parent's pending marker.
+        if (alive(Number(launch.pid)) && (!workerState
+          || (workerState.launchId !== launch.launchId && workerState.startedAt < launch.startedAt))) {
+          throw new ConfigError(409, '对话组进程正在启动，请先停止后重试。');
+        }
+      } catch (error) {
+        if (error instanceof ConfigError) throw error;
+        if (!missing(error)) throw new ConfigError(409, `后台启动记录无效，请检查 .piq/${file}。`);
+      }
+    }
+    try {
+      const terminalPath = join(runtimeDirectory, 'terminal-return.json');
+      await ordinaryGroupPath(terminalPath, false);
+      if ((await lstat(terminalPath)).size > 16_384) throw new Error();
+      const terminal: unknown = JSON.parse(await readFile(terminalPath, 'utf8'));
+      const validPid = (value: unknown) => Number.isSafeInteger(value) && Number(value) > 0;
+      if (!object(terminal) || terminal.version !== 1 || typeof terminal.token !== 'string' || !terminal.token
+        || !validPid(terminal.launcherPid) || typeof terminal.createdAt !== 'number' || !Number.isFinite(terminal.createdAt)
+        || !['starting', 'watching', 'recovering', 'error'].includes(String(terminal.state))
+        || [terminal.monitorPid, terminal.wrapperPid, terminal.piPid].some(value => value !== undefined && !validPid(value))) throw new Error();
+      const liveTerminal = [terminal.wrapperPid, terminal.piPid].some(value => validPid(value) && alive(Number(value)));
+      const pendingReturn = terminal.state !== 'error'
+        && [terminal.monitorPid, terminal.launcherPid].some(value => validPid(value) && alive(Number(value)));
+      if (liveTerminal || pendingReturn) throw new ConfigError(409, '终端 Pi 或后台恢复仍在运行，请先停止本对话组后重试。');
+    } catch (error) {
+      if (error instanceof ConfigError) throw error;
+      if (!missing(error)) throw new ConfigError(409, '终端恢复记录无效，请检查 .piq/terminal-return.json。');
+    }    const token = randomUUID();
+    let leaseDirectory = checked.path;
+    const acquired: string[] = [];
+    try {
+      for (const file of ['start.lock', 'owner.lock']) {
+        try {
+          await exclusiveFile(join(runtimeDirectory, file), JSON.stringify({ ...(file === 'owner.lock' ? { version: 1 } : {}), pid: process.pid, token }));
+        } catch (error) {
+          if (codeIs(error, 'EEXIST')) throw new ConfigError(409, '对话组刚开始运行或启动，请先停止后重试。');
+          throw error;
+        }
+        acquired.push(file);
+      }
+      return await operation({ ...checked, config, relocated: path => { leaseDirectory = path; } });
+    } finally {
+      for (const file of acquired.reverse()) {
+        const path = join(leaseDirectory, '.piq', file);
+        try {
+          const value: unknown = JSON.parse(await readFile(path, 'utf8'));
+          if (object(value) && value.token === token) await unlink(path);
+        } catch (error) { if (!missing(error)) throw error; }
+      }
+    }
+  });
+}
+
+/** Remove a stopped group from the registry while retaining its complete directory. */
+export async function deleteGroup(cwd: string): Promise<{ deleted: true; id: string; recoveryPath: string }> {
+  return withStoppedGroup(cwd, async group => {
+    const trash = join(group.root, '.trash');
+    await mkdir(trash, { recursive: true });
+    await ordinaryGroupPath(trash, true);
+    const recoveryPath = join(trash, `${group.id}-${Date.now()}-${randomUUID()}`);
+    if (!contained(group.root, recoveryPath) || dirname(recoveryPath) !== trash) throw new ConfigError(400, '回收目录无效。');
+    await ordinaryGroupPath(group.path, true);
+    const exchangeDirectory = join(group.root, '.piq-slang');
+    const exchangePath = join(exchangeDirectory, `${group.id}.json`);
+    let retainedExchange: string | undefined;
+    try {
+      await ordinaryGroupPath(exchangeDirectory, true);
+      await ordinaryGroupPath(exchangePath, false);
+      retainedExchange = join(group.path, '.piq', `shared-slang-${randomUUID()}.json`);
+      await rename(exchangePath, retainedExchange);
+    } catch (error) { if (!missing(error)) throw error; }
+    try { await rename(group.path, recoveryPath); }
+    catch (error) {
+      // The stopped source is the only writer of its outbox; restore it if the directory move fails.
+      if (retainedExchange) await rename(retainedExchange, exchangePath);
+      throw error;
+    }
+    group.relocated(recoveryPath);
+    return { deleted: true, id: group.id, recoveryPath };
+  });
+}
+
+async function copyKnowledgeDirectory(source: string, destination: string): Promise<void> {
+  await ordinaryGroupPath(source, true);
+  await mkdir(destination);
+  for (const item of await readdir(source, { withFileTypes: true })) {
+    if (['.pi', '.piq', 'sessions', 'messages', 'runtime'].includes(item.name.toLowerCase())
+      || /^auth(?:\.|$)|^\.env(?:\.|$)/i.test(item.name)) continue;
+    const from = join(source, item.name), to = join(destination, item.name);
+    // realpath checks also reject Windows junctions reported as ordinary directories.
+    const info = await lstat(from);
+    await ordinaryGroupPath(from, info.isDirectory());
+    if (info.isDirectory()) await copyKnowledgeDirectory(from, to);
+    else if (info.isFile() && info.nlink === 1) await copyFile(from, to);
+    else throw new ConfigError(400, '复制只接受无硬链接的普通资料文件。');
+  }
+}
+
+/** Copy reusable knowledge and settings, leaving conversation ownership and runtime behind. */
+export async function copyGroup(cwd: string, name: string): Promise<{ id: string; name: string; path: string }> {
+  return withStoppedGroup(cwd, async group => {
+    const id = validateGroupId(`${group.id.slice(0, 49)}-copy-${randomUUID().replaceAll('-', '').slice(0, 8)}`);
+    const config = validateConfig({ ...group.config, id, name, conversations: [] });
+    await checkAssignments(group.root, config);
+    const temporary = join(group.root, `.copy-${randomUUID()}`);
+    const path = join(group.root, id);
+    await mkdir(temporary);
+    // Partial copies remain hidden and inspectable if validation or an I/O operation fails.
+    for (const item of await readdir(group.path, { withFileTypes: true })) {
+      if (!item.name.toLowerCase().endsWith('.md') || item.name.toLowerCase() === 'piq.md') continue;
+      const from = join(group.path, item.name);
+      await ordinaryGroupPath(from, false);
+      if ((await lstat(from)).nlink !== 1) throw new ConfigError(400, '复制只接受无硬链接的普通文档。');
+      await copyFile(from, join(temporary, item.name));
+    }
+    await exclusiveFile(join(temporary, 'PIQ.md'), `# 对话组 ${config.name}\n\n复制的资料不附带对话归属，请先添加本组对话。\n\n` + '```json\n' + JSON.stringify(config, null, 2) + '\n```\n');
+    for (const directory of ['assets', 'memory']) {
+      try { await ordinaryGroupPath(join(group.path, directory), true); }
+      catch (error) { if (missing(error)) continue; throw error; }
+      await copyKnowledgeDirectory(join(group.path, directory), join(temporary, directory));
+    }
+    const settingsDirectory = join(group.path, '.pi');
+    try {
+      await ordinaryGroupPath(settingsDirectory, true);
+      const settingsPath = join(settingsDirectory, 'settings.json');
+      await ordinaryGroupPath(settingsPath, false);
+      const original: unknown = JSON.parse(await readFile(settingsPath, 'utf8'));
+      if (!object(original)) throw new ConfigError(400, '源组 Pi 设置无效。');
+      const settings = Object.fromEntries(['packages', 'defaultProvider', 'defaultModel', 'defaultThinkingLevel']
+        .filter(key => original[key] !== undefined).map(key => [key, original[key]]));
+      if (settings.packages !== undefined && !Array.isArray(settings.packages)) throw new ConfigError(400, '源组 packages 设置无效。');
+      for (const field of ['defaultProvider', 'defaultModel', 'defaultThinkingLevel']) {
+        if (settings[field] !== undefined && typeof settings[field] !== 'string') throw new ConfigError(400, '源组模型设置无效。');
+      }
+      await mkdir(join(temporary, '.pi'));
+      await exclusiveFile(join(temporary, '.pi', 'settings.json'), JSON.stringify(settings, null, 2) + '\n');
+    } catch (error) { if (!missing(error)) throw error; }
+    try { await lstat(path); throw new ConfigError(409, '副本目录已存在，请重试。'); }
+    catch (error) { if (!missing(error)) throw error; }
+    await rename(temporary, path);
+    return { id, name: config.name, path };
   });
 }

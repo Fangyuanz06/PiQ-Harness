@@ -5,7 +5,7 @@ import { dirname, join, relative, isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { defaultMessagesRoot } from './cli.ts';
-import { initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, validateConfig, validateGroupId, type GroupConfig } from './config.ts';
+import { copyGroup, deleteGroup, initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, validateConfig, validateGroupId, type GroupConfig } from './config.ts';
 import { conversationKey, conversationDirectory, parseConversationKey, type Conversation } from './conversations.ts';
 import { credentialStatus, getRunningOwner, openGroupTerminal } from './web-terminal.ts';
 import { getModelPreference, listModels, saveModelPreference, type ModelCatalog } from './web-models.ts';
@@ -15,6 +15,7 @@ import { cancelTerminalReturn } from './terminal-monitor.ts';
 import { getProcessStatus, handoffToTerminal, startGroup } from './process-manager.ts';
 import { ensureSnowLuma, openSnowLumaManual, type SnowLumaServiceResult } from './snowluma-service.ts';
 import { parseStoredRecord } from './store.ts';
+import { SlangStore } from './slang.ts';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const DOCS = new Set(['AGENTS.md', 'PERSONA.md', 'MEMORY.md']);
@@ -229,8 +230,22 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       }
       if (parts[1] !== 'groups' || !parts[2]) throw new HttpError(404, '未找到接口。');
       const id = validateGroupId(parts[2]);
+      if ((method === 'DELETE' && parts.length === 3) || (method === 'POST' && parts.length === 4 && parts[3] === 'copy')) {
+        const body = method === 'POST' ? await readBody(request) : undefined;
+        await exclusive(`run:${id}`, async () => {
+          if ((launching.get(id) ?? 0) > Date.now()) throw new HttpError(409, '终端正在打开，请等启动完成并停止后重试。');
+          const result = method === 'DELETE' ? await deleteGroup(join(root, id)) : await copyGroup(join(root, id), body?.name as string);
+          services.delete(join(root, id));
+          json(response, result);
+        });
+        return;
+      }
       const cwd = await groupPath(id);
-      if (parts[3] === 'model' && parts.length === 4) {
+      if (method === 'GET' && parts.length === 4 && parts[3] === 'slang') {
+        const config = (await loadConfig(cwd))!;
+        json(response, { entries: await new SlangStore(cwd, config.conversations).listAll(), conversations: config.conversations });
+        return;
+      }      if (parts[3] === 'model' && parts.length === 4) {
         const runtimeState = async () => {
           const owner = await getRunningOwner(cwd);
           const status = await readModelStatus(cwd);
@@ -308,7 +323,8 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       if (method === 'POST' && parts[3] === 'open' && parts.length === 4) {
         await readBody(request);
         if (!(await loadConfig(cwd))!.conversations.length) throw new HttpError(400,'请先添加至少一个对话。');
-        await exclusive(`open:${id}`, async () => {
+        await exclusive(`run:${id}`, async () => {
+          await groupPath(id);
           const owner = await getRunningOwner(cwd);
           const process = await getProcessStatus(cwd);
           if (owner.running && process.mode !== 'background') { json(response, { alreadyRunning: true, message: `本群 Pi 已在终端运行（PID ${owner.pid}），请切换到原终端。` }); return; }

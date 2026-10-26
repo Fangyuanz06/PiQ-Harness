@@ -78,17 +78,20 @@ async function worker(cwd: string): Promise<Worker | null> {
 }
 
 async function pendingLaunch(cwd: string): Promise<PendingLaunch | null> {
-  try {
-    const path = await localPath(cwd, 'worker-launch.json');
-    if ((await lstat(path)).size > 16_384) throw new Error();
-    const value: unknown = JSON.parse(await readFile(path, 'utf8'));
-    if (!object(value) || value.version !== 1 || !Number.isSafeInteger(value.pid) || Number(value.pid) <= 0
-      || typeof value.launchId !== 'string' || !value.launchId || typeof value.startedAt !== 'number'
-      || !Number.isFinite(value.startedAt) || value.startedAt < 0) throw new Error();
-    return value as unknown as PendingLaunch;
-  } catch (error) { if (missing(error)) return null; throw new Error('后台启动记录无效，请检查本群 .piq/worker-launch.json。'); }
+  // New releases publish worker-launch.json; retain read compatibility with earlier PiQ launches.
+  for (const file of ['worker-launch.json', 'launch.json']) {
+    try {
+      const path = await localPath(cwd, file);
+      if ((await lstat(path)).size > 16_384) throw new Error();
+      const value: unknown = JSON.parse(await readFile(path, 'utf8'));
+      if (!object(value) || value.version !== 1 || !Number.isSafeInteger(value.pid) || Number(value.pid) <= 0
+        || typeof value.launchId !== 'string' || !value.launchId || typeof value.startedAt !== 'number'
+        || !Number.isFinite(value.startedAt) || value.startedAt < 0) throw new Error();
+      return value as unknown as PendingLaunch;
+    } catch (error) { if (!missing(error)) throw new Error(`后台启动记录无效，请检查本群 .piq/${file}。`); }
+  }
+  return null;
 }
-
 async function savePendingLaunch(cwd: string, launch: PendingLaunch): Promise<void> {
   const path = await localPath(cwd, 'worker-launch.json', true);
   const temporary = `${path}.${randomUUID()}.tmp`;

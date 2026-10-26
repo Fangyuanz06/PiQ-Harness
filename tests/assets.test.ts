@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, realpath, symlink, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, realpath, symlink, rm, unlink, rmdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
@@ -29,6 +29,16 @@ test('local media resolves in its group and rejects sibling and linked files', a
       }
       throw error;
     }
+    linkTest.after(async () => {
+      const linked = join(group, 'assets', 'linked');
+      try { await unlink(linked); }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return;
+        if (code === 'EPERM' || code === 'EISDIR') await rmdir(linked);
+        else throw error;
+      }
+    });
     await assert.rejects(resolveImage(group, 'assets/linked/private.png'), /当前对话组目录/);
   });
 });

@@ -15,9 +15,14 @@ import { RunController, type ConnectionState } from './run-control.ts';
 import { ensureSnowLuma } from './snowluma-service.ts';
 import { registerGroupFileTool } from './group-files.ts';
 import { registerAlbumTool } from './albums.ts';
+import { registerMessageMediaTool } from './message-media.ts';
+import { registerForwardMessageTool } from './forward-messages.ts';
 import { manageSticker } from './sticker-management.ts';
 import { workspaceFile } from './workspace-files.ts';
 import { registerTerminal } from './terminal-monitor.ts';
+import { SlangStore } from './slang.ts';
+import { registerSlangTools } from './slang-tools.ts';
+import { registerPersonaGuard } from './persona-guard.ts';
 
 const SIGNAL = 'piq:messages';
 
@@ -27,6 +32,7 @@ interface Binding {
   config: GroupConfig;
   ctx: ExtensionContext;
   store: GroupStore;
+  slang: SlangStore;
   transport: SnowLumaTransport;
   notifier: Notifier;
   histories: Map<string, HistorySync>;
@@ -55,6 +61,7 @@ export async function resolveImage(cwd: string, path: string): Promise<string> {
 }
 
 export default function piq(pi: ExtensionAPI): void {
+  registerPersonaGuard(pi);
   let binding: Binding | undefined;
   let generation = 0;
 
@@ -88,6 +95,7 @@ export default function piq(pi: ExtensionAPI): void {
       const adopted = await adoptTemporaryConversation(current.cwd,event.conversation);
       if (!adopted) return;
       current.config = adopted;
+      current.slang.addConversation(event.conversation);
       current.store.addConversation(event.conversation);
       history = addHistory(current,event.conversation);
       if (!current.closed && current.transport.isConnected) history.connect();
@@ -190,7 +198,7 @@ export default function piq(pi: ExtensionAPI): void {
         if (startGeneration !== generation) { await releaseConversations(); await store.close(); return; }
       }
       const current = {
-        id: randomUUID(), cwd: ctx.cwd, ctx, config, store,
+        id: randomUUID(), cwd: ctx.cwd, ctx, config, store, slang: new SlangStore(ctx.cwd, config.conversations),
         releaseConversations, histories: new Map<string, HistorySync>(),
         closed: false, status: 'connecting', sendAbort: new AbortController(), resumeTurn: false, receiving: Promise.resolve(),
       } as Binding;
@@ -466,5 +474,8 @@ export default function piq(pi: ExtensionAPI): void {
   });
   registerGroupFileTool(pi, resourceContext);
   registerAlbumTool(pi, resourceContext);
+  registerMessageMediaTool(pi, resourceContext);
+  registerForwardMessageTool(pi, resourceContext);
+  registerSlangTools(pi, () => binding);
   registerModelControl(pi);
 }

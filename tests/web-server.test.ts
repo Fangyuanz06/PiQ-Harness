@@ -587,3 +587,53 @@ test('model API preserves Pi settings and safely addresses live changes to the c
   assert.equal(finalSettings.theme, 'existing-theme');
   assert.equal(finalSettings.privateTestToken, 'KEEP_ON_DISK_ONLY');
 });
+
+test('group deletion requires local authorization and preserves stopped data in the recovery directory', async t => {
+  const f = await fixture(t);
+  const route = '/api/groups/123456';
+  await writeFile(join(f.cwd, 'PERSONA.md'), '# 保存原始人格');
+  await writeFile(join(f.messageDir, '2026-10-26.jsonl'), logLine(logRecord(1)));
+  assert.equal((await fetch(f.app.url + route, { method: 'DELETE' })).status, 403);
+  assert.equal((await fetch(f.app.url + route, { method: 'DELETE', headers: { ...f.headers, Origin: 'https://attacker.example' } })).status, 403);
+  assert.equal((await f.call('/api/groups/absent', 'DELETE')).status, 404);
+  const response = await f.call(route, 'DELETE');
+  assert.equal(response.status, 200, await response.clone().text());
+  const deleted = await response.json() as { deleted: boolean; id: string; recoveryPath: string };
+  assert.equal(deleted.deleted, true); assert.equal(deleted.id, '123456');
+  assert.ok(deleted.recoveryPath.startsWith(join(f.root, '.trash')));
+  assert.equal(await readFile(join(deleted.recoveryPath, 'PERSONA.md'), 'utf8'), '# 保存原始人格');
+  assert.equal(await readFile(join(deleted.recoveryPath, 'messages', 'group', '123456', '2026-10-26.jsonl'), 'utf8'), logLine(logRecord(1)));
+  assert.equal((await f.call(route)).status, 404);
+  assert.deepEqual((await f.get<State>('/api/state')).groups, []);
+});
+
+test('group copy returns an unassigned knowledge copy and live groups refuse copy and deletion', async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.cwd, 'MEMORY.md'), '# 可复制的知识');
+  const response = await f.call('/api/groups/123456/copy', 'POST', { name: '复制的朋友' });
+  assert.equal(response.status, 200, await response.clone().text());
+  const copied = await response.json() as { id: string; name: string; path: string };
+  assert.equal(copied.name, '复制的朋友'); assert.match(copied.id, /^123456-copy-/);
+  const detail = await f.get<Group>(`/api/groups/${copied.id}`);
+  assert.deepEqual(detail.config.conversations, []);
+  assert.equal(await readFile(join(copied.path, 'MEMORY.md'), 'utf8'), '# 可复制的知识');
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'test-owner' }));
+  assert.equal((await f.call('/api/groups/123456', 'DELETE')).status, 409);
+  assert.equal((await f.call('/api/groups/123456/copy', 'POST', { name: '运行时不复制' })).status, 409);
+});
+
+test('slang WebUI returns retained entries for an empty group and reports damaged libraries', async t => {
+  const f = await fixture(t);
+  const candidate = { conversation: 'group:123456', term: '绝绝子', meaning: '赞叹', usage: '轻松聊天中赞叹', example: '这波绝绝子', cautions: '', status: 'candidate', evidenceSeqs: [], sources: [{ title: '参考', url: 'https://example.com/slang' }], updatedAt: 123 };
+  await mkdir(join(f.cwd, '.piq'), { recursive: true });
+  const route = '/api/groups/123456/slang';
+  assert.deepEqual(await f.get(route), { entries: [], conversations: [{ type: 'group', id: '123456' }] });
+  await writeFile(join(f.cwd, '.piq', 'slang.json'), JSON.stringify({ version: 1, entries: [candidate] }));
+  const detail = await f.get<Group>('/api/groups/123456');
+  assert.equal((await f.call('/api/groups/123456/config', 'PUT', { config: { ...detail.config, conversations: [] }, revision: detail.configRevision })).status, 200);
+  assert.deepEqual(await f.get(route), { entries: [candidate], conversations: [] });
+  await writeFile(join(f.cwd, '.piq', 'slang.json'), '{broken');
+  const damaged = await f.call(route); assert.equal(damaged.status, 400);
+  assert.match((await damaged.json() as { error: string }).error, /词库读取失败/);
+  assert.equal(await readFile(join(f.cwd, '.piq', 'slang.json'), 'utf8'), '{broken');
+});

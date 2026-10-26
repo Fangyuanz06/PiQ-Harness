@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, rmdir, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
@@ -288,8 +288,19 @@ test('monitor metadata refuses links outside the group', async t => {
     await rename(join(f.cwd, '.piq-original'), join(f.cwd, '.piq'));
     t.skip('The OS sandbox does not permit directory links.'); return;
   }
-  await assert.rejects(prepareTerminalReturn(f.cwd), /普通/);
-  assert.equal(await getTerminalReturnError(f.cwd) !== undefined, true);
+  try {
+    await assert.rejects(prepareTerminalReturn(f.cwd), /普通/);
+    assert.equal(await getTerminalReturnError(f.cwd) !== undefined, true);
+  } finally {
+    const linked = join(f.cwd, '.piq');
+    try { await unlink(linked); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EPERM' || code === 'EISDIR') await rmdir(linked);
+      else if (code !== 'ENOENT') throw error;
+    }
+    await rename(join(f.cwd, '.piq-original'), join(f.cwd, '.piq'));
+  }
 });
 
 test('the detached monitor survives its launcher and recovers after a real terminal child is killed', async t => {

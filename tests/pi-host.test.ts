@@ -11,7 +11,7 @@ import {
   fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore,
   type FauxResponseStep,
 } from '@earendil-works/pi-ai';
-import { initializeGroup, loadConfig } from '../src/config.ts';
+import { initializeGroup, loadConfig, type GroupConfig } from '../src/config.ts';
 import { GroupStore } from '../src/store.ts';
 import { normalizeMessageEvent } from '../src/transport.ts';
 import { conversationKey, type Conversation } from '../src/conversations.ts';
@@ -143,7 +143,7 @@ async function fixture(t: TestContext) {
   const originalSocket = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket');
   Object.defineProperty(globalThis, 'WebSocket', { value: LocalSocket, configurable: true, writable: true });
   // Any accidental model/catalog HTTP call fails locally instead of using credentials or the network.
-  t.mock.method(globalThis, 'fetch', async () => { throw new Error('Network access is disabled in Pi integration tests'); });
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Network access is disabled in Pi integration tests'); });
   const sessions: AgentSession[] = [];
   t.after(async () => {
     try {
@@ -159,14 +159,15 @@ async function fixture(t: TestContext) {
     }
   });
 
-  async function host(groupId: string, marker: string, responses: FauxResponseStep[], prepare?: (cwd: string) => Promise<void>, conversations: Conversation[] = [{ type: 'group', id: groupId }], quietMs = 60) {
+  async function host(groupId: string, marker: string, responses: FauxResponseStep[], prepare?: (cwd: string) => Promise<void>, conversations: Conversation[] = [{ type: 'group', id: groupId }], quietMs = 60, slang?: GroupConfig['slang']) {
     const cfg = { id: groupId, name: groupId, conversations };
     const cwd = await initializeGroup(root, groupId, cfg);
     await prepare?.(cwd);
     await writeFile(join(cwd, 'AGENTS.md'), `# This group's instructions\n\n${marker}\n`);
     await writeFile(join(cwd, 'PIQ.md'), '# Connection\n\n```json\n' + JSON.stringify({
-      ...cfg, wsUrl: 'ws://127.0.0.1:9/', accessTokenEnv: 'PIQ_TEST_UNUSED_TOKEN',
+      ...cfg, ...(groupId === 'persona-guard' ? { permissions: { commands: false, otherTools: false } } : {}), wsUrl: 'ws://127.0.0.1:9/', accessTokenEnv: 'PIQ_TEST_UNUSED_TOKEN',
       quietMs, maxWaitMs: Math.max(200, quietMs * 2), minIntervalMs: 0,
+      ...(slang === undefined ? {} : { slang }),
     }) + '\n```\n');
     const agentDir = join(root, `agent-${groupId}`);
     await mkdir(agentDir);
@@ -201,7 +202,7 @@ async function fixture(t: TestContext) {
     return { cwd, session, faux, socket, errors, notifications };
   }
 
-  return { root, host };
+  return { root, host, fetchMock };
 }
 
 test('real Pi loads per-group Markdown, receives a signal, reads records and sends only explicit replies', async t => {
@@ -932,4 +933,343 @@ test('local voice sending rejects outside files and cannot dispatch while paused
   assert.equal(sockets.flatMap(socket => socket.sent).filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0);
   assert.doesNotMatch(JSON.stringify(sockets.flatMap(socket => socket.sent)), /OTHER_GROUP_AUDIO_BYTES|LOCAL_CANCELLABLE_AUDIO/);
   assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('real Pi learns group slang from journal evidence, shares it within its PiQ group and migrates selected entries', async t => {
+  const f = await fixture(t);
+  const groupId = '123409';
+  const privateId = '876503';
+  const destinationId = '123410';
+  const term = '白饭';
+  const shared = await f.host('slang-shared', 'SLANG_SHARED_GROUP', [
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'context', conversation: `group:${groupId}`, query: term }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang', {
+      action: 'learn', conversation: `group:${groupId}`, term, meaning: '本群对免费模型额度的称呼',
+      usage: '讨论免费额度用尽或恢复时使用', example: '今天的白饭吃完了', cautions: '仅按本群语境理解',
+      status: 'learned', evidenceSeqs: [1, 2],
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'query', conversation: `private:${privateId}`, query: term }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'query', conversation: `group:${destinationId}`, query: term }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang_search', { conversation: `group:${groupId}`, term }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'export', conversation: `group:${groupId}`, terms: [term] }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('This ordinary reply remains in Pi after learning.'),
+  ], undefined, [{ type: 'group', id: groupId }, { type: 'private', id: privateId }]);
+  assert.ok(shared.session.getActiveToolNames().includes('qq_slang'));
+  assert.ok(shared.session.getActiveToolNames().includes('qq_slang_search'));
+  shared.socket.receive(groupMessage(groupId, 1, '今天的白饭吃完了，等免费额度恢复'));
+  shared.socket.receive(groupMessage(groupId, 2, '免费额度恢复了，又有白饭吃了'));
+  await eventually(() => shared.faux.state.callCount === 7 && shared.session.isIdle, 'the slang tool workflow to settle');
+
+  assert.deepEqual(shared.errors, []);
+  assert.deepEqual(shared.notifications, []);
+  const results = shared.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 6);
+  assert.equal(results[0]!.isError, false);
+  const context = results[0]!.details as { messages: Array<{ seq: number; text: string }> };
+  assert.deepEqual(context.messages.map(message => message.seq).sort(), [1, 2]);
+  assert.ok(context.messages.every(message => message.text.includes(term)), 'context resolves the real journal text');
+  assert.equal(results[1]!.isError, false);
+  const learned = results[1]!.details as { entry: { term: string; conversation: string; evidenceSeqs: number[]; status: string } };
+  assert.equal(learned.entry.term, term);
+  assert.equal(learned.entry.status, 'learned');
+  assert.deepEqual(learned.entry.evidenceSeqs, [1, 2]);
+  assert.equal(results[2]!.isError, false);
+  const queried = results[2]!.details as { entries: Array<{ term: string; conversation: string; usage: string }> };
+  assert.equal(queried.entries.length, 1, 'a private dialog in the same PiQ group can query the shared vocabulary');
+  assert.equal(queried.entries[0]!.term, term);
+  assert.equal(queried.entries[0]!.conversation, `group:${groupId}`, 'shared entries preserve their source conversation');
+  assert.match(queried.entries[0]!.usage, /免费额度/);
+  assert.equal(results[3]!.isError, true, 'another PiQ group cannot be used as the query target');
+  assert.equal(results[4]!.toolName, 'qq_slang_search');
+  assert.equal(results[4]!.isError, true, 'online research is off by default');
+  assert.equal(f.fetchMock.mock.callCount(), 0, 'a disabled search does not make an HTTP request');
+  assert.equal(results[5]!.isError, false);
+  const exported = results[5]!.details as { version: number; entries: Array<{ term: string; meaning: string; usage: string; example: string; cautions: string; sources: Array<{ title: string; url: string }> }> };
+  assert.equal(exported.version, 1);
+  assert.equal(exported.entries.length, 1);
+  assert.equal(exported.entries[0]!.term, term);
+  assert.equal(Object.hasOwn(exported.entries[0]!, 'evidenceSeqs'), false, 'migration leaves the original chat evidence behind');
+  assert.equal(Object.hasOwn(exported.entries[0]!, 'conversation'), false, 'migration does not expose the original dialog identifier');
+  assert.doesNotMatch(JSON.stringify(exported), /等免费额度恢复|又有白饭吃了/);
+
+  const destination = await f.host('slang-imported', 'SLANG_DESTINATION_GROUP', [
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'import', conversation: `group:${destinationId}`, entries: exported.entries }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'query', conversation: `group:${destinationId}`, query: term }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('The imported meaning still needs this group\'s own evidence.'),
+  ], undefined, [{ type: 'group', id: destinationId }]);
+  destination.socket.receive(groupMessage(destinationId, 1, '我们来看看导入的词条'));
+  await eventually(() => destination.faux.state.callCount === 3 && destination.session.isIdle, 'the imported vocabulary to be queried');
+  assert.deepEqual(destination.errors, []);
+  assert.deepEqual(destination.notifications, []);
+  const importedResults = destination.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(importedResults.length, 2);
+  assert.ok(importedResults.every(message => !message.isError));
+  const imported = importedResults[1]!.details as { entries: Array<{ term: string; conversation: string; status: string; evidenceSeqs: number[] }> };
+  assert.equal(imported.entries.length, 1);
+  assert.equal(imported.entries[0]!.term, term);
+  assert.equal(imported.entries[0]!.conversation, `group:${destinationId}`);
+  assert.equal(imported.entries[0]!.status, 'candidate', 'an import does not imply locally learned usage');
+  assert.deepEqual(imported.entries[0]!.evidenceSeqs, []);
+  for (const host of [shared, destination]) {
+    assert.equal(host.socket.sent.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0,
+      'slang tools and ordinary assistant output do not send QQ messages');
+  }
+  assert.equal(f.fetchMock.mock.callCount(), 0);
+});
+
+test('real Pi rejects slang tools when learning is disabled and keeps receiving ordinary messages', async t => {
+  const f = await fixture(t);
+  const groupId = '123411';
+  const host = await f.host('slang-disabled', 'SLANG_DISABLED_GROUP', [
+    fauxAssistantMessage(fauxToolCall('qq_slang', {
+      action: 'learn', conversation: `group:${groupId}`, term: '白饭', meaning: '免费额度', usage: '讨论额度',
+      status: 'learned', evidenceSeqs: [1, 2],
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'query', conversation: `group:${groupId}`, query: '白饭' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang_search', { conversation: `group:${groupId}`, term: '白饭' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('The message is available without slang learning.'),
+  ], undefined, [{ type: 'group', id: groupId }], 60, { enabled: false, webResearch: true });
+  host.socket.receive(groupMessage(groupId, 1, '白饭就是免费额度'));
+  host.socket.receive(groupMessage(groupId, 2, '今天又吃上白饭了'));
+  await eventually(() => host.faux.state.callCount === 4 && host.session.isIdle, 'the disabled learning workflow to settle');
+  assert.deepEqual(host.errors, []);
+  assert.deepEqual(host.notifications, []);
+  const results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 3);
+  assert.ok(results.every(message => message.isError), 'the feature switch applies to every slang operation');
+  assert.equal(f.fetchMock.mock.callCount(), 0);
+  assert.equal(host.socket.sent.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0);
+  const signal = host.session.messages.find(message => message.role === 'custom' && message.customType === 'piq:messages');
+  assert.ok(signal, 'switching off learning preserves normal message notification');
+  assert.match(JSON.stringify(signal), /2 条新消息/);
+});
+
+test('real Pi keeps persona files readable and blocks tool mutations while allowing ordinary memory writes', async t => {
+  const f = await fixture(t);
+  const groupId = '123412';
+  const persona = '# Persona\n\nFIXED_PERSONA_IDENTITY\n';
+  const host = await f.host('persona-guard', 'PERSONA_GUARD_GROUP', [
+    fauxAssistantMessage(fauxToolCall('read', { path: 'PERSONA.md' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('write', { path: 'PERSONA.md', content: 'REPLACED_BY_WRITE' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('edit', { path: 'PERSONA.md', oldText: 'FIXED_PERSONA_IDENTITY', newText: 'REPLACED_BY_EDIT' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('bash', { command: "printf 'REPLACED_BY_BASH' > PERSONA.md" }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('powershell', { path: 'PERSONA.md' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('mutate_persona', { path: 'PERSONA.md' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('write', { path: '@PERSONA.md', content: 'REPLACED_BY_AT_ALIAS' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('edit', { path: '@PERSONA.md', oldText: 'FIXED_PERSONA_IDENTITY', newText: 'REPLACED_BY_AT_EDIT' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('write', { path: 'MEMORY.md', content: '# Memory\n\nA useful group fact.\n' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('The original persona remains in effect.'),
+  ], async cwd => {
+    await writeFile(join(cwd, 'PERSONA.md'), persona);
+    const extensions = join(cwd, '.pi', 'extensions');
+    await mkdir(extensions, { recursive: true });
+    // These local tools would overwrite the persona if the tool_call hook let them execute.
+    // A real registered tool is needed here: a nonexistent-tool error would prove no protection.
+    await writeFile(join(extensions, 'mutation-fixture.ts'), `
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { Type } from 'typebox';
+export default function mutationFixture(pi) {
+  for (const name of ['powershell', 'mutate_persona']) {
+    pi.registerTool({
+      name, label: name, description: 'Test-only persona mutation tool.',
+      parameters: Type.Object({ path: Type.String() }),
+      async execute(_id, params, _signal, _update, ctx) {
+        await writeFile(join(ctx.cwd, params.path), 'REPLACED_BY_' + name);
+        await writeFile(join(ctx.cwd, name + '-executed'), 'executed');
+        return { content: [{ type: 'text', text: 'Mutation executed.' }], details: {} };
+      },
+    });
+  }
+}
+`);
+  }, [{ type: 'group', id: groupId }]);
+  assert.ok(host.session.getActiveToolNames().includes('powershell'));
+  assert.ok(host.session.getActiveToolNames().includes('mutate_persona'));
+  host.socket.receive(groupMessage(groupId, 1, '请记住这个普通群内事实'));
+  await eventually(() => host.faux.state.callCount === 10 && host.session.isIdle, 'the persona protection workflow to settle');
+  assert.deepEqual(host.errors, []);
+  assert.deepEqual(host.notifications, []);
+  const results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 9);
+  assert.equal(results[0]!.toolName, 'read');
+  assert.equal(results[0]!.isError, false);
+  assert.match(JSON.stringify(results[0]!.content), /FIXED_PERSONA_IDENTITY/);
+  for (const result of results.slice(1, 8)) {
+    assert.equal(result.isError, true, `${result.toolName} must be blocked before changing persona files`);
+    assert.doesNotMatch(JSON.stringify(result.content), /not found|not registered|ENOENT|could not find/i,
+      'the protection hook, rather than a missing tool or shell, must reject the mutation');
+  }
+  assert.equal(results[8]!.toolName, 'write');
+  assert.equal(results[8]!.isError, false, 'ordinary group memory remains writable');
+  assert.equal(await readFile(join(host.cwd, 'PERSONA.md'), 'utf8'), persona);
+  assert.equal(await readFile(join(host.cwd, 'MEMORY.md'), 'utf8'), '# Memory\n\nA useful group fact.\n');
+  const files = await readdir(host.cwd);
+  assert.equal(files.includes('powershell-executed'), false);
+  assert.equal(files.includes('mutate_persona-executed'), false);
+  assert.equal(host.socket.sent.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0);
+});
+
+test('real Pi agents automatically share selected slang only between opted-in conversation groups', async t => {
+  const f = await fixture(t);
+  const sourceId = '123413';
+  const targetId = '123414';
+  const defaultId = '123415';
+  const term = 'yyds';
+  const reason = '这个表达是通用网络赞叹用语，含义和例句不涉及本群身份或私人事件，适合其他组参考。';
+  const source = await f.host('auto-source', 'AUTO_TRANSFER_SOURCE', [
+    fauxAssistantMessage(fauxToolCall('qq_slang', {
+      action: 'learn', conversation: `group:${sourceId}`, term, meaning: '永远的神，用来表达强烈赞赏',
+      usage: '轻松聊天中赞赏某人的操作或成果', example: '这个操作 yyds',
+      status: 'learned', evidenceSeqs: [1, 2],
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang_transfer', {
+      action: 'publish', conversation: `group:${sourceId}`, terms: [term], reason,
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('The broadly useful expression was selected for sharing.'),
+  ], undefined, [{ type: 'group', id: sourceId }], 60, { enabled: true, webResearch: false, autoMigrate: true });
+  source.socket.receive(groupMessage(sourceId, 1, '你这波操作 yyds，修得太快了'));
+  source.socket.receive(groupMessage(sourceId, 2, '这套配置真 yyds，问题解决了'));
+  await eventually(() => source.faux.state.callCount === 3 && source.session.isIdle, 'the source agent to publish its chosen expression');
+  assert.deepEqual(source.errors, []);
+  assert.deepEqual(source.notifications, []);
+  const sourceResults = source.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(sourceResults.length, 2);
+  assert.ok(sourceResults.every(result => !result.isError));
+  const published = sourceResults[1]!.details as { entries: Array<{ id: string; fromGroup: string; reason: string; entry: { term: string } }> };
+  assert.equal(published.entries.length, 1);
+  assert.equal(published.entries[0]!.entry.term, term);
+  assert.equal(published.entries[0]!.reason, reason, 'the agent records why this knowledge is appropriate to share');
+  assert.equal(published.entries[0]!.fromGroup, 'auto-source');
+  assert.doesNotMatch(JSON.stringify(published), /修得太快了|问题解决了|evidenceSeqs|123413/,
+    'the shared knowledge contains no journal evidence or original conversation identifier');
+
+  let target: Awaited<ReturnType<typeof f.host>>;
+  target = await f.host('auto-target', 'AUTO_TRANSFER_TARGET', [
+    fauxAssistantMessage(fauxToolCall('qq_slang_transfer', { action: 'discover' }), { stopReason: 'toolUse' }),
+    () => {
+      const discovery = target.session.messages.filter(message => message.role === 'toolResult').at(-1)!;
+      assert.equal(discovery.isError, false);
+      const discovered = discovery.details as { entries: Array<{ id: string; entry: { term: string } }> };
+      const selected = discovered.entries.filter(item => item.entry.term === term);
+      assert.equal(selected.length, 1, 'the target agent sees the eligible shared expression and selects it');
+      assert.equal(selected[0]!.id, published.entries[0]!.id);
+      return fauxAssistantMessage(fauxToolCall('qq_slang_transfer', {
+        action: 'adopt', conversation: `group:${targetId}`, ids: selected.map(item => item.id),
+      }), { stopReason: 'toolUse' });
+    },
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'query', conversation: `group:${targetId}`, query: term }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('This group can now check the candidate against its own context.'),
+  ], undefined, [{ type: 'group', id: targetId }], 60, { enabled: true, webResearch: false, autoMigrate: true });
+  target.socket.receive(groupMessage(targetId, 1, '这里最近有什么值得学的网络表达吗'));
+  await eventually(() => target.faux.state.callCount === 4 && target.session.isIdle, 'the target agent to discover and adopt shared knowledge');
+  assert.deepEqual(target.errors, []);
+  assert.deepEqual(target.notifications, []);
+  const targetResults = target.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(targetResults.length, 3);
+  assert.ok(targetResults.every(result => !result.isError));
+  const adopted = targetResults[1]!.details as { entries: Array<{ term: string; conversation: string; status: string; evidenceSeqs: number[] }> };
+  assert.equal(adopted.entries.length, 1);
+  assert.equal(adopted.entries[0]!.term, term);
+  assert.equal(adopted.entries[0]!.conversation, `group:${targetId}`);
+  assert.equal(adopted.entries[0]!.status, 'candidate');
+  assert.deepEqual(adopted.entries[0]!.evidenceSeqs, []);
+  const queried = targetResults[2]!.details as { entries: Array<{ term: string; status: string }> };
+  assert.equal(queried.entries[0]!.term, term);
+  assert.equal(queried.entries[0]!.status, 'candidate');
+
+  const defaultGroup = await f.host('auto-default', 'DEFAULT_MIGRATION_DISABLED', [
+    fauxAssistantMessage(fauxToolCall('qq_slang_transfer', { action: 'discover' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang_transfer', {
+      action: 'adopt', conversation: `group:${defaultId}`, ids: [published.entries[0]!.id],
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('Automatic migration remains disabled for this group.'),
+  ], undefined, [{ type: 'group', id: defaultId }]);
+  defaultGroup.socket.receive(groupMessage(defaultId, 1, '普通聊天通知'));
+  await eventually(() => defaultGroup.faux.state.callCount === 3 && defaultGroup.session.isIdle, 'the default group to reject automatic migration');
+  assert.deepEqual(defaultGroup.errors, []);
+  assert.deepEqual(defaultGroup.notifications, []);
+  const blocked = defaultGroup.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(blocked.length, 2);
+  assert.ok(blocked.every(result => result.isError));
+  assert.ok(blocked.every(result => /autoMigrate|迁移/.test(JSON.stringify(result.content))),
+    'rejection explains the migration setting');
+  for (const host of [source, target, defaultGroup]) {
+    assert.equal(host.socket.sent.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0,
+      'learning and automatic migration do not send an ordinary assistant reply to QQ');
+  }
+  assert.equal(f.fetchMock.mock.callCount(), 0);
+});
+
+test('search-enabled Pi requires local evidence and searches only the term without changing its vocabulary', async t => {
+  const f = await fixture(t);
+  const groupId = '123416';
+  const conversation = `group:${groupId}`;
+  const term = 'yyds';
+  const privateMarker = 'PRIVATE_CHAT_CONTEXT_ONLY_FOR_LOCAL_LEARNING';
+  const imported = { term, meaning: '永远的神', usage: '轻松语境下赞赏表现', example: '这波操作 yyds', cautions: '', sources: [] };
+  let beforeSearch = '';
+  let host: Awaited<ReturnType<typeof f.host>>;
+  let searchFetch: ReturnType<typeof t.mock.method<typeof globalThis, 'fetch'>>;
+  host = await f.host('slang-search-evidence', 'SLANG_SEARCH_EVIDENCE', [
+    fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'import', conversation, entries: [imported] }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_slang_search', { conversation, term }), { stopReason: 'toolUse' }),
+    () => {
+      const results = host.session.messages.filter(message => message.role === 'toolResult');
+      assert.equal(results.length, 2);
+      assert.equal(results[0]!.isError, false);
+      const importedResult = results[0]!.details as { entries: Array<{ status: string; evidenceSeqs: number[] }> };
+      assert.equal(importedResult.entries[0]!.status, 'candidate');
+      assert.deepEqual(importedResult.entries[0]!.evidenceSeqs, []);
+      assert.equal(results[1]!.isError, true, 'an imported candidate cannot authorize a network search');
+      assert.match(JSON.stringify(results[1]!.content), /真实聊天证据/);
+      assert.equal(searchFetch.mock.callCount(), 0, 'zero-evidence imports reject before HTTP dispatch');
+      assert.equal(f.fetchMock.mock.callCount(), 0);
+      return fauxAssistantMessage(fauxToolCall('qq_slang', {
+        action: 'learn', conversation, ...imported, evidenceSeqs: [1, 2], status: 'learned',
+      }), { stopReason: 'toolUse' });
+    },
+    async () => {
+      beforeSearch = await readFile(join(host.cwd, '.piq', 'slang.json'), 'utf8');
+      return fauxAssistantMessage(fauxToolCall('qq_slang_search', { conversation, term }), { stopReason: 'toolUse' });
+    },
+    async () => {
+      assert.equal(await readFile(join(host.cwd, '.piq', 'slang.json'), 'utf8'), beforeSearch,
+        'search clues do not automatically update the vocabulary');
+      return fauxAssistantMessage(fauxToolCall('qq_slang', { action: 'query', conversation, query: term }), { stopReason: 'toolUse' });
+    },
+    fauxAssistantMessage('Search clues are available for comparison with the local chat context.'),
+  ], undefined, [{ type: 'group', id: groupId }], 60, { enabled: true, webResearch: true });
+  searchFetch = t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    assert.equal(url.origin + url.pathname, 'https://www.bing.com/search');
+    assert.deepEqual([...url.searchParams], [['q', `${term} 梗 含义 用法`], ['format', 'rss']]);
+    assert.equal(init?.redirect, 'error');
+    assert.equal(init?.body, undefined);
+    assert.deepEqual(init?.headers, { Accept: 'application/rss+xml, application/xml, text/xml' });
+    assert.doesNotMatch(url.href + JSON.stringify(init?.headers), new RegExp(`${privateMarker}|${groupId}|88888|99999`));
+    return new Response('<?xml version="1.0"?><rss version="2.0"><channel>'
+      + '<item><title>Unrelated news</title><link>https://example.com/unrelated</link><description>A different topic</description></item>'
+      + '<item><title>yyds 的常见含义</title><link>https://example.com/yyds</link><description>yyds 常用于赞叹出色的表现，具体用法仍需结合语境。</description></item>'
+      + '</channel></rss>');
+  });
+  host.socket.receive(groupMessage(groupId, 1, `${privateMarker} 这波操作 yyds`));
+  host.socket.receive(groupMessage(groupId, 2, `${privateMarker} 解决得真快，yyds`));
+  await eventually(() => host.faux.state.callCount === 6 && host.session.isIdle, 'the evidence-gated search workflow to settle');
+  assert.deepEqual(host.errors, []);
+  assert.deepEqual(host.notifications, []);
+  assert.equal(searchFetch.mock.callCount(), 1, 'only the evidence-backed search reaches the mock provider');
+  const results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 5);
+  assert.deepEqual(results.map(result => result.isError), [false, true, false, false, false]);
+  const search = results[3]!.details as { results: Array<{ title: string; url: string; snippet: string }> };
+  assert.deepEqual(search.results, [{ title: 'yyds 的常见含义', url: 'https://example.com/yyds', snippet: 'yyds 常用于赞叹出色的表现，具体用法仍需结合语境。' }]);
+  assert.match(JSON.stringify(results[3]!.content), /搜索线索/);
+  assert.doesNotMatch(JSON.stringify(results[3]!.content), new RegExp(privateMarker));
+  const queried = results[4]!.details as { entries: Array<{ status: string; evidenceSeqs: number[]; sources: unknown[] }> };
+  assert.equal(queried.entries[0]!.status, 'learned');
+  assert.deepEqual(queried.entries[0]!.evidenceSeqs, [1, 2]);
+  assert.deepEqual(queried.entries[0]!.sources, [], 'a search result is not silently promoted to a stored source');
+  assert.equal(await readFile(join(host.cwd, '.piq', 'slang.json'), 'utf8'), beforeSearch);
+  assert.equal(host.socket.sent.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0);
 });
