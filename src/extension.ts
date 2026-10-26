@@ -16,6 +16,7 @@ import { ensureSnowLuma } from './snowluma-service.ts';
 import { registerGroupFileTool } from './group-files.ts';
 import { registerAlbumTool } from './albums.ts';
 import { manageSticker } from './sticker-management.ts';
+import { workspaceFile } from './workspace-files.ts';
 
 const SIGNAL = 'piq:messages';
 
@@ -412,15 +413,23 @@ export default function piq(pi: ExtensionAPI): void {
     },
   });
   pi.registerTool({
-    name: 'qq_voice', label: 'QQ AI 语音与转写',
-    description: 'list 查询指定群可用的 QQ AI 音色；send 使用 text 和 characterId 向该群发送 QQ AI 语音；transcribe 按 messageId 获取指定对话中语音消息的 QQ 转文字结果。群 AI 语音不支持好友或临时私聊。',
+    name: 'qq_voice', label: 'QQ 语音',
+    description: 'send_file 将本组 path 音频文件作为语音消息发送，支持群聊、好友和临时私聊，最大 32 MiB。list 查询群 QQ AI 音色；send 用 text 和 characterId 发送群 AI 语音；transcribe 按 messageId 获取语音转文字结果。',
     parameters: Type.Object({
-      action: Type.Union([Type.Literal('list'), Type.Literal('send'), Type.Literal('transcribe')]),
+      action: Type.Union([Type.Literal('list'), Type.Literal('send'), Type.Literal('send_file'), Type.Literal('transcribe')]),
       conversation: Type.String(), text: Type.Optional(Type.String()), characterId: Type.Optional(Type.String()),
-      messageId: Type.Optional(Type.Integer()),
+      messageId: Type.Optional(Type.Integer()), path: Type.Optional(Type.String()),
     }),
     async execute(_id, params, signal, _update, ctx) {
       const { current, target, sendSignal } = action(ctx, params.conversation, signal);
+      if (params.action === 'send_file') {
+        if (!params.path) throw new Error('发送语音文件需要 path。');
+        const file = await workspaceFile(current.cwd, params.path);
+        const result = await current.transport.sendRecord(target, file, sendSignal);
+        const warning = await rememberSend(current, target, result.messageId, '[语音]', [{ type: 'record', data: { file } }]);
+        return { content: [{ type: 'text', text: `已发送语音到 ${conversationKey(target)}，message_id=${result.messageId}${warning}` }],
+          details: { conversation: target, ...result, warning: warning || undefined } };
+      }
       if (params.action === 'list') {
         const voices = await current.transport.getVoices(target, sendSignal);
         return { content: [{ type: 'text', text: JSON.stringify(voices) }], details: { conversation: target, voices } };

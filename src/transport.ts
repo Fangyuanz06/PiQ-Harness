@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { open, readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { OneBotApiError, OneBotClient } from './onebot-client.ts';
 import { conversationKey, validateConversation, type Conversation } from './conversations.ts';
@@ -90,6 +90,35 @@ function emojiId(value: unknown): string {
     throw new Error('Emoji ID must be a non-empty string without control characters.');
   }
   return value;
+}
+
+async function recordBytes(file: string, signal: AbortSignal): Promise<Buffer> {
+  if (typeof file !== 'string' || !file.trim() || /[\u0000-\u001f\u007f]/.test(file)
+    || (/^[a-z][a-z\d+.-]*:/i.test(file) && !/^[a-z]:[\\/]/i.test(file))) {
+    throw new Error('语音需要本地音频文件路径。');
+  }
+  signal.throwIfAborted();
+  const handle = await open(file, 'r');
+  try {
+    const entry = await handle.stat();
+    if (!entry.isFile()) throw new Error('语音须为普通音频文件。');
+    const limit = 32 * 1024 * 1024;
+    if (entry.size > limit) throw new Error('语音文件不能超过 32 MiB。');
+    const chunks: Buffer[] = [];
+    let length = 0;
+    while (true) {
+      signal.throwIfAborted();
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, limit - length + 1));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, null);
+      signal.throwIfAborted();
+      if (!bytesRead) break;
+      length += bytesRead;
+      if (length > limit) throw new Error('语音文件不能超过 32 MiB。');
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    if (!length) throw new Error('语音文件不能为空。');
+    return Buffer.concat(chunks, length);
+  } finally { await handle.close(); }
 }
 
 export function normalizePokeEvent(event: Record<string, unknown>): PokeEvent | undefined {
@@ -431,6 +460,25 @@ export class SnowLumaTransport {
     }
     this.assertConnection(version);
     return transcribeVoice(this.client, value, requestSignal);
+  }
+
+  /** Send file bytes as one voice message; the backend never receives a local filesystem path. */
+  async sendRecord(conversationInput: Conversation, file: string, signal?: AbortSignal): Promise<{ messageId: string }> {
+    const conversation = validateConversation(conversationInput);
+    const requestSignal = this.requestSignal(signal);
+    const bytes = await recordBytes(file, requestSignal);
+    requestSignal.throwIfAborted();
+    const message = [{ type: 'record', data: { file: `base64://${bytes.toString('base64')}` } }];
+    const result = await this.mutate<Record<string, unknown> | null>(conversation.type === 'group' ? 'send_group_msg' : 'send_private_msg', {
+      ...(conversation.type === 'group' ? { group_id: Number(conversation.id) } : { user_id: Number(conversation.id) }),
+      ...(conversation.type === 'temporary' ? { group_id: Number(conversation.sourceGroupId) } : {}),
+      message,
+    }, requestSignal);
+    const receipt = id(result?.message_id, true);
+    if (!receipt || Number(receipt) < -2_147_483_648 || Number(receipt) > 2_147_483_647) {
+      throw new Error('Voice send result is unknown: SnowLuma returned an invalid message receipt.');
+    }
+    return { messageId: receipt };
   }
 
   /** The anchor is inclusive. No anchor requests the most recent available records. */

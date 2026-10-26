@@ -20,6 +20,7 @@ import { readRuntimeStatus, requestRunAction } from '../src/run-control.ts';
 /** Fake only the network boundary: Pi and SnowLuma both run their real implementations. */
 class LocalSocket extends EventTarget {
   static instances: LocalSocket[] = [];
+  static autoOpen = true;
   static history = new Map<string, Array<Record<string, unknown>>>();
   static messages = new Map<number, Record<string, unknown>>();
   static transcripts = new Map<number, string>();
@@ -34,7 +35,7 @@ class LocalSocket extends EventTarget {
     super();
     this.url = url;
     LocalSocket.instances.push(this);
-    queueMicrotask(() => {
+    if (LocalSocket.autoOpen) queueMicrotask(() => {
       this.readyState = 1;
       this.dispatchEvent(new Event('open'));
     });
@@ -116,7 +117,9 @@ async function conversationRecords(cwd: string, conversation: Conversation): Pro
     .flatMap(contents => contents.trimEnd().split('\n').filter(Boolean).map(line => JSON.parse(line)));
 }
 
-const messagesDirectory = (cwd: string, conversation: Conversation) => join(cwd, 'messages', conversation.type, conversation.id);
+const messagesDirectory = (cwd: string, conversation: Conversation) => conversation.type === 'temporary'
+  ? join(cwd, 'messages', conversation.type, conversation.sourceGroupId!, conversation.id)
+  : join(cwd, 'messages', conversation.type, conversation.id);
 
 async function eventually(check: () => boolean | Promise<boolean>, description: string): Promise<void> {
   const deadline = Date.now() + 8_000;
@@ -131,6 +134,7 @@ async function fixture(t: TestContext) {
   process.env.PIQ_SNOWLUMA_AUTOSTART = '0';
   t.after(() => { if (oldAutostart === undefined) delete process.env.PIQ_SNOWLUMA_AUTOSTART; else process.env.PIQ_SNOWLUMA_AUTOSTART = oldAutostart; });
   LocalSocket.history.clear();
+  LocalSocket.autoOpen = true;
   LocalSocket.messages.clear(); LocalSocket.transcripts.clear(); LocalSocket.nextMessageId = -900;
   // Windows Codex's virtualized OS temp denies rename; the channel uses atomic rename for receipts.
   const tempRoot = join(process.cwd(), '.test-tmp');
@@ -835,5 +839,97 @@ test('group resource tools refuse foreign scope and sibling assets, and all reso
   const resourceActions = ['get_group_root_files', 'create_group_file_folder', 'get_qun_album_list', 'modify_custom_face', 'download_file', 'add_custom_face'];
   assert.equal(host.socket.sent.filter(packet => resourceActions.includes(packet.action)).length, 0);
   assert.doesNotMatch(JSON.stringify(host.socket.sent), /OTHER_GROUP_PRIVATE_ASSET_BYTES|LOCAL_PAUSED_RESOURCE_BYTES/);
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('real Pi explicitly sends a local voice file to group, friend and temporary conversations with separate journals', async t => {
+  const f = await fixture(t);
+  const groupId = '444017';
+  const peerId = '444018';
+  const temporaryId = '444019';
+  const conversations: Conversation[] = [
+    { type: 'group', id: groupId }, { type: 'private', id: peerId },
+    { type: 'temporary', sourceGroupId: groupId, id: temporaryId },
+  ];
+  const audio = Buffer.from('LOCAL_AUDIO_FILE_BYTES');
+  const host = await f.host('local-voice-actions', 'LOCAL_VOICE_ACTIONS', [
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send_file', conversation: `group:${groupId}`, path: 'assets/reply.wav' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send_file', conversation: `private:${peerId}`, path: 'assets/reply.wav' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send_file', conversation: `temporary:${groupId}:${temporaryId}`, path: 'assets/reply.wav' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('This ordinary answer stays in Pi after the three explicit audio sends.'),
+  ], async cwd => { await writeFile(join(cwd, 'assets', 'reply.wav'), audio); }, conversations);
+  await host.session.prompt('Send the saved voice file explicitly to the three selected conversations.');
+  const sends = host.socket.sent.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action));
+  const message = [{ type: 'record', data: { file: `base64://${audio.toString('base64')}` } }];
+  assert.deepEqual(sends.map(packet => [packet.action, packet.params]), [
+    ['send_group_msg', { group_id: Number(groupId), message }],
+    ['send_private_msg', { user_id: Number(peerId), message }],
+    ['send_private_msg', { user_id: Number(temporaryId), group_id: Number(groupId), message }],
+  ]);
+  assert.equal(host.socket.sent.filter(packet => ['send_group_ai_record', 'download_file'].includes(packet.action)).length, 0);
+  const results = host.session.messages.filter(record => record.role === 'toolResult' && record.toolName === 'qq_voice');
+  assert.equal(results.length, 3);
+  assert.ok(results.every(result => result.role === 'toolResult' && !result.isError));
+  const ids = new Set<string>();
+  for (const conversation of conversations) {
+    const records = await conversationRecords(host.cwd, conversation);
+    assert.equal(records.length, 1);
+    const record = records[0]!;
+    assert.deepEqual(record.conversation, conversation);
+    assert.equal(record.outgoing, true);
+    assert.equal(record.rawText, '[语音]');
+    assert.equal(record.segments.length, 1);
+    assert.equal(record.segments[0].type, 'record');
+    assert.equal(record.segments[0].data.file, join(host.cwd, 'assets', 'reply.wav'));
+    assert.match(record.messageId, /^-\d+$/);
+    ids.add(record.messageId);
+  }
+  assert.equal(ids.size, 3, 'each send retains its distinct backend receipt');
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('local voice sending rejects outside files and cannot dispatch while paused or cancelled during reconnect', async t => {
+  const f = await fixture(t);
+  const groupId = '444020';
+  const conversation = `group:${groupId}`;
+  const sibling = await initializeGroup(f.root, 'other-audio', { name: 'Other audio group', conversations: [] });
+  const outsideAudio = join(sibling, 'assets', 'private.wav');
+  await writeFile(outsideAudio, 'OTHER_GROUP_AUDIO_BYTES');
+  const host = await f.host('local-voice-boundaries', 'LOCAL_VOICE_BOUNDARIES', [
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send_file', conversation, path: '../other-audio/assets/private.wav' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send_file', conversation, path: outsideAudio }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send_file', conversation, path: 'https://invalid.test/voice.wav' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('Outside files were refused.'),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send_file', conversation, path: 'assets/reply.wav' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('The paused audio send was refused.'),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send_file', conversation, path: 'assets/reply.wav' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('This response should be interrupted by cancellation.'),
+  ], async cwd => { await writeFile(join(cwd, 'assets', 'reply.wav'), 'LOCAL_CANCELLABLE_AUDIO'); }, [{ type: 'group', id: groupId }]);
+  await host.session.prompt('Check audio file scope before any external send.');
+  let results = host.session.messages.filter(record => record.role === 'toolResult' && record.toolName === 'qq_voice');
+  assert.equal(results.length, 3);
+  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  const pause = await requestRunAction(host.cwd, 'pause');
+  await eventually(async () => (await readRuntimeStatus(host.cwd))?.requestId === pause.requestId, 'local audio pause receipt');
+  await host.session.prompt('Try to send the local voice file while paused.');
+  results = host.session.messages.filter(record => record.role === 'toolResult' && record.toolName === 'qq_voice');
+  assert.equal(results.length, 4);
+  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  assert.match(JSON.stringify(results[3]), /PiQ 已暂停/);
+  const resume = await requestRunAction(host.cwd, 'resume');
+  await eventually(async () => (await readRuntimeStatus(host.cwd))?.requestId === resume.requestId, 'local audio resume receipt');
+  const socketsBefore = LocalSocket.instances.length;
+  LocalSocket.autoOpen = false;
+  host.socket.close();
+  const sending = host.session.prompt('Send the local audio after reconnecting.');
+  await eventually(() => LocalSocket.instances.length > socketsBefore, 'the audio action to wait on a fresh connection');
+  assert.equal(host.faux.state.callCount, 7, 'the cancellable tool call has started, without a final assistant response');
+  assert.equal(host.session.isIdle, false);
+  await host.session.abort();
+  await Promise.allSettled([sending]);
+  assert.equal(host.session.isIdle, true);
+  const sockets = [host.socket, ...LocalSocket.instances.slice(socketsBefore)];
+  assert.equal(sockets.flatMap(socket => socket.sent).filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0);
+  assert.doesNotMatch(JSON.stringify(sockets.flatMap(socket => socket.sent)), /OTHER_GROUP_AUDIO_BYTES|LOCAL_CANCELLABLE_AUDIO/);
   assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
 });

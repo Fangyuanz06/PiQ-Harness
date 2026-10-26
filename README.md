@@ -130,7 +130,7 @@ Agent 还可以按需要使用以下交互工具。conversation 均使用本组�
 | qq_react | 给群消息添加或取消表情回应，指定 messageId、emojiId，set 默认 true。 |
 | qq_recall | 撤回本账号发送的消息。撤回前核验消息属于指定对话，且发送者是本账号。 |
 | qq_sticker | action 支持 list、send、add、remove、rename、promote。按 emojiId 发送、删除、改名或置顶；add 从本组 path 添加，rename 使用 name。发送支持群聊与好友私聊，可带 replyTo 引用。收藏由当前 QQ 账号全局共用。 |
-| qq_voice | action 为 list 时列出原生 QQ AI 声音，为 send 时按 text、characterId 发送，仅限群聊；transcribe 按 messageId 转写语音，支持群聊、私聊及可确认来源的临时会话。 |
+| qq_voice | send_file 按本组 path 向群聊、私聊或临时会话发送本地语音；list 列出原生 QQ AI 声音，send 按 text、characterId 发送 QQ AI 语音，这两项仅限群聊；transcribe 按 messageId 转写语音，支持群聊、私聊及可确认来源的临时会话。 |
 | qq_group_files | 群文件与目录操作，action 支持 list、upload、download、mkdir、move、rename_file、rename_folder、delete_file、delete_folder。conversation 仅限群聊。 |
 | qq_album | 操作已有群相册，action 支持 list、media、upload_image、upload_video、delete_media、comment、like；like 使用 set: false 取消赞。conversation 仅限群聊。 |
 
@@ -145,6 +145,14 @@ Agent 还可以按需要使用以下交互工具。conversation 均使用本组�
 ```
 
 qq_sticker 与 qq_voice 可以先用 action: "list" 查询后端提供的收藏表情或声音。发送收藏表情使用返回的 emojiId；发送 AI 语音时，将声音列表 voices[].characters[].id 的值填入 characterId。语音转写使用 action: "transcribe" 和语音消息的 messageId。
+
+Pi 可使用 MiMo TTS 生成语音，保存到本组目录，再显式调用 qq_voice 发送文件。例如：
+
+```json
+{"action":"send_file","conversation":"group:123456789","path":"assets/voices/reply.wav"}
+```
+
+本地语音文件上限 32 MiB，发送遵守本组成员归属与暂停状态。MiMo 凭据通过本机用户环境变量 MIMO_API_KEY 提供，密钥不写入文档。
 
 群文件、收藏表情和相册的本地上传，共用后端暂存：先通过 download_file 的 base64 参数把文件交给后端，再进行上传。本地 path 限于本组目录，单文件上限 32 MiB。群文件下载以流方式写入本组目录，上限 128 MiB，默认保存为 assets/downloads/UUID.bin；可以指定 path 保留文件名，已有文件不会覆盖。操作能否成功取决于当前 QQ 账号的群权限、配额以及后端支持情况。
 

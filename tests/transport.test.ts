@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate as immediate, setTimeout as delay } from 'node:timers/promises';
@@ -627,4 +627,95 @@ test('AI voice cancellation, API failures and missing receipts do not trigger an
   f.socket().respond = false;
   await assert.rejects(f.transport.speak(GROUP, 'hello', 'voice-1'), /result is unknown/);
   assert.deepEqual(f.socket().sent.map(packet => packet.action), ['send_group_ai_record', 'send_group_ai_record']);
+});
+
+test('local voice files use one record segment with explicit group, private and temporary routing', async t => {
+  const f = fixture(); t.after(() => f.transport.close());
+  const directory = await mkdtemp(join(tmpdir(), 'piq-record-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'speech.wav');
+  const bytes = Buffer.from([82, 73, 70, 70, 0, 1, 2, 255]);
+  await writeFile(path, bytes);
+  const message = [{ type: 'record', data: { file: `base64://${bytes.toString('base64')}` } }];
+  assert.deepEqual(await f.transport.sendRecord(GROUP, path), { messageId: '-42' });
+  assert.deepEqual(await f.transport.sendRecord(PRIVATE, path), { messageId: '-42' });
+  assert.deepEqual(await f.transport.sendRecord(TEMPORARY, path), { messageId: '-42' });
+  assert.deepEqual(f.socket().sent.map(packet => [packet.action, packet.params]), [
+    ['send_group_msg', { group_id: 20001, message }],
+    ['send_private_msg', { user_id: 10002, message }],
+    ['send_private_msg', { user_id: 10002, group_id: 30001, message }],
+  ]);
+  assert.equal(f.socket().sent.some(packet => JSON.stringify(packet.params).includes(path)), false);
+});
+
+test('invalid, empty and oversized audio sources fail before any network action', async t => {
+  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
+  const directory = await mkdtemp(join(tmpdir(), 'piq-record-inputs-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  for (const file of ['https://example.test/voice.wav', 'file:///voice.wav', 'base64://abcd', 'data:audio/wav;base64,abcd', '']) {
+    await assert.rejects(f.transport.sendRecord(GROUP, file), /本地音频文件/);
+  }
+  await assert.rejects(f.transport.sendRecord(GROUP, join(directory, 'missing.wav')), /ENOENT/);
+  await assert.rejects(f.transport.sendRecord(GROUP, directory));
+  const empty = join(directory, 'empty.wav'); await writeFile(empty, '');
+  await assert.rejects(f.transport.sendRecord(GROUP, empty), /不能为空/);
+  const large = join(directory, 'large.wav');
+  const handle = await open(large, 'w');
+  try { await handle.truncate(32 * 1024 * 1024 + 1); } finally { await handle.close(); }
+  await assert.rejects(f.transport.sendRecord(GROUP, large), /32 MiB/);
+  assert.equal(f.socket().sent.length, 0);
+});
+
+test('audio cancellation and session closure while opening a file never dispatch or reconnect', async t => {
+  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
+  const directory = await mkdtemp(join(tmpdir(), 'piq-record-cancel-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'speech.wav'); await writeFile(path, 'audio-bytes');
+  await assert.rejects(f.transport.sendRecord(GROUP, path, AbortSignal.abort()), /aborted/i);
+  const caller = new AbortController();
+  const cancelled = f.transport.sendRecord(GROUP, path, caller.signal);
+  caller.abort(new Error('record cancelled by caller'));
+  await assert.rejects(cancelled, /record cancelled by caller/);
+  const sockets = FakeWebSocket.instances.length;
+  const closing = f.transport.sendRecord(GROUP, path);
+  f.transport.close();
+  await assert.rejects(closing, /closed/);
+  assert.equal(FakeWebSocket.instances.length, sockets);
+  assert.equal(f.socket().sent.length, 0);
+});
+
+test('audio send timeouts and invalid receipts remain unknown without replaying', async t => {
+  const f = fixture(15); t.after(() => f.transport.close()); await f.transport.connect();
+  const directory = await mkdtemp(join(tmpdir(), 'piq-record-receipt-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'speech.wav'); await writeFile(path, 'audio-bytes');
+  f.socket().respond = false;
+  await assert.rejects(f.transport.sendRecord(GROUP, path), /result is unknown/);
+  assert.equal(f.socket().sent.length, 1);
+  f.socket().respond = true;
+  for (const receipt of [null, {}, { message_id: 0 }, { message_id: 2_147_483_648 }]) {
+    f.socket().dataForAction = () => receipt;
+    await assert.rejects(f.transport.sendRecord(PRIVATE, path), /result is unknown/);
+  }
+  assert.equal(f.socket().sent.length, 5);
+  f.socket().response = { status: 'failed', retcode: 403, data: { message_id: 0 } };
+  await assert.rejects(f.transport.sendRecord(GROUP, path), error => error instanceof OneBotApiError && error.retcode === 403);
+  assert.equal(f.socket().sent.length, 6);
+});
+
+test('a dropped audio receipt is never resent after reconnect', async t => {
+  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
+  const directory = await mkdtemp(join(tmpdir(), 'piq-record-disconnect-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'speech.wav'); await writeFile(path, 'audio-bytes');
+  const old = f.socket(); old.respond = false;
+  const sending = f.transport.sendRecord(GROUP, path);
+  const deadline = Date.now() + 1000;
+  while (!old.sent.length && Date.now() < deadline) await delay(5);
+  assert.equal(old.sent.length, 1);
+  old.close();
+  await assert.rejects(sending, /result is unknown/);
+  await f.transport.connect();
+  assert.notEqual(f.socket(), old);
+  assert.equal(f.socket().sent.length, 0);
 });
