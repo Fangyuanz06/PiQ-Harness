@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>PiQ · 对话工作台</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="对话组目录">
+      <a class="brand" href="/" aria-label="PiQ 对话工作台">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M5 6.5h14M9 6.5c0 5.2-1 8.8-3 11M16.5 6.5l-1 8.4c-.2 1.8.6 2.6 2.5 2.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="brand-name">PiQ<span class="brand-caption">对话工作台</span></span>
+      </a>
+      <div class="sidebar-heading"><span>对话组</span><span id="group-count" class="count">0</span></div>
+      <nav id="group-list" class="group-list" aria-label="选择对话组"><p class="sidebar-empty">正在读取对话组目录…</p></nav>
+      <button id="add-group" class="add-group" type="button"><span aria-hidden="true">＋</span> 新建对话组</button>
+      <div class="sidebar-bottom">
+        <span class="local-label"><span class="status-dot" aria-hidden="true"></span>本地运行</span>
+        <p id="root-path" class="root-path" title="对话组目录位置">文档 / PiQ-Messages</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topline"><span>工作空间</span><div class="topline-right"><span class="topline-note">独立会话 · Markdown 文档</span><label class="theme-control" for="theme-mode"><span>外观</span><select id="theme-mode" aria-label="外观主题"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label></div></div>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <section id="welcome" class="welcome" hidden>
+        <span class="welcome-mark" aria-hidden="true">π</span>
+        <h1>从一个对话组开始</h1>
+        <p>把相关群聊和私聊放在一起，共用文档、记忆和 Pi 会话。</p>
+        <button id="welcome-add" class="button primary" type="button">新建第一个对话组</button>
+      </section>
+
+      <section id="group-workspace" hidden aria-label="当前对话组工作空间">
+        <header class="group-header">
+          <div class="group-heading">
+            <div class="heading-row"><h1 id="group-title">对话组</h1><span id="run-status" class="run-status">Pi 未运行</span><span id="connection-status" class="connection-status">SnowLuma 未连接</span></div>
+            <p id="group-path" class="group-path"></p>
+            <p id="run-description" class="run-description" role="status" aria-live="polite"></p>
+            <div id="pending-dialogs" class="pending-dialogs" aria-label="按对话分类的待处理消息" hidden></div>
+          </div>
+          <div class="run-actions">
+            <button id="run-action" class="button primary run-button" type="button" disabled>启动 Pi</button>
+            <button id="stop-run" class="button subtle stop-button" type="button" hidden>停止</button>
+            <button id="open-terminal" class="button terminal-button" type="button">
+              <svg aria-hidden="true" width="18" height="18" viewBox="0 0 20 20" fill="none"><path d="m5 6 4 4-4 4M11 14h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span>在终端打开</span>
+              <span class="arrow" aria-hidden="true">↗</span>
+            </button>
+          </div>
+        </header>
+
+        <div id="service-recovery" class="service-recovery" hidden>
+          <div class="service-recovery-copy"><p id="service-message">启动 Pi 时会先检查 SnowLuma。</p><p id="service-diagnostic" class="service-diagnostic" hidden></p></div>
+          <div class="service-recovery-actions"><button id="recover-connection" class="button subtle" type="button">重试连接</button><button id="open-snowluma" class="button subtle" type="button">打开 SnowLuma</button></div>
+        </div>
+
+        <div class="tabs" role="tablist" aria-label="管理内容">
+          <button id="tab-conversations" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-conversations" data-tab="conversations" tabindex="-1">对话</button>
+          <button id="tab-documents" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="panel-documents" data-tab="documents">文档</button>
+          <button id="tab-messages" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-messages" data-tab="messages" tabindex="-1">消息记录</button>
+          <button id="tab-model" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-model" data-tab="model" tabindex="-1">模型</button>
+          <button id="tab-connection" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-connection" data-tab="connection" tabindex="-1">连接设置</button>
+          <span id="terminal-note" class="tabs-note">继续本对话组最近的会话</span>
+        </div>
+
+        <section id="panel-conversations" class="tab-panel" role="tabpanel" aria-labelledby="tab-conversations" hidden>
+          <div class="section-intro"><div><h2>对话与归属</h2><p>组内对话共用一套文档、记忆、模型和 Pi 会话。每个对话只能属于一个对话组。</p></div><button id="reload-config" class="button subtle" type="button" disabled>重新读取配置</button></div>
+          <p id="membership-outdated" class="membership-lock" role="status" hidden>对话组有新的归属或名称变更。当前草稿已保留，请重新读取配置后再编辑。</p>
+          <form id="membership-form" class="settings-card">
+            <div class="settings-section">
+              <div class="field"><label for="group-name">对话组名称</label><input id="group-name" name="name" type="text" maxlength="80" required autocomplete="off" disabled></div>
+              <p id="membership-lock" class="membership-lock" role="status" hidden>请先停止本对话组的 Pi，再调整名称或对话归属；暂停时仍会接收消息。</p>
+              <div id="conversation-rows" class="conversation-rows" aria-label="本组对话"></div>
+              <button id="add-conversation" class="button subtle" type="button" disabled>添加对话</button>
+              <p class="field-help membership-help">群聊填写群号，私聊填写对方 QQ 号；群临时私聊还包含来源群号。同组群聊产生的临时私聊会自动归入本组。移除对话会停止接收它的新消息，已有记录与记忆仍保留在本组。</p>
+            </div>
+            <div class="editor-footer"><span id="membership-state" class="save-state">正在读取…</span><button id="save-membership" class="button save-button" type="submit" disabled>保存对话组</button></div>
+          </form>
+        </section>
+
+        <section id="panel-documents" class="tab-panel" role="tabpanel" aria-labelledby="tab-documents">
+          <div class="section-intro"><div><h2>留给 Agent 的文档</h2><p id="document-hint">在这里写下本对话组的人设、语气和偏好。</p></div></div>
+          <div class="editor-card">
+            <div class="editor-toolbar">
+              <div class="document-picker" role="group" aria-label="选择文档">
+                <button class="document-button" type="button" data-document="ROOT_AGENTS.md">公共 AGENTS.md</button>
+                <button class="document-button" type="button" data-document="AGENTS.md">本对话组 AGENTS.md</button>
+                <button class="document-button active" type="button" data-document="PERSONA.md" aria-pressed="true">PERSONA.md</button>
+                <button class="document-button" type="button" data-document="MEMORY.md">MEMORY.md</button>
+              </div>
+              <span class="file-type">Markdown</span>
+            </div>
+            <label class="sr-only" id="editor-label" for="document-content">PERSONA.md 内容</label>
+            <textarea id="document-content" class="document-editor" spellcheck="false" aria-labelledby="editor-label" placeholder="在这里写下本对话组的人设、语气和偏好…" disabled></textarea>
+            <div class="editor-footer"><span id="document-state" class="save-state">正在读取…</span><button id="save-document" class="button save-button" type="button" disabled>保存文档</button></div>
+          </div>
+          <p class="footnote">公共与本对话组 AGENTS.md 由 Pi 原生加载；其他文档按需读取。保存后，在运行中的 Pi 执行 /reload 可重新加载。</p>
+        </section>
+
+        <section id="panel-messages" class="tab-panel" role="tabpanel" aria-labelledby="tab-messages" hidden>
+          <div class="section-intro"><div><h2>对话消息</h2><p>每个对话独立保存消息。先选择对话，再查看对应日期的 JSONL 记录。</p></div><button id="refresh-logs" class="button subtle" type="button">刷新记录</button></div>
+          <div class="messages-card">
+            <div class="messages-toolbar"><label for="log-conversation">对话</label><select id="log-conversation"><option value="">暂无对话</option></select><label for="log-date">日期</label><select id="log-date" disabled><option value="">暂无记录</option></select><span id="log-note" class="muted"></span></div>
+            <div id="messages-empty" class="empty-state"><span aria-hidden="true">—</span><p>还没有消息记录</p><small>启动本对话组 Pi 并连接 SnowLuma 后，消息会出现在这里。</small></div>
+            <p id="log-error" class="inline-error" role="alert" hidden></p>
+            <div id="message-list" class="message-list" hidden></div>
+            <details id="raw-log" class="raw-log" hidden><summary>查看原始 JSONL</summary><pre id="log-content" tabindex="0"></pre></details>
+          </div>
+        </section>
+
+        <section id="panel-connection" class="tab-panel" role="tabpanel" aria-labelledby="tab-connection" hidden>
+          <div class="section-intro"><div><h2>连接与消息聚合</h2><p>设置保存在本对话组 PIQ.md 中，重启或 /reload 后生效。</p></div></div>
+          <form id="connection-form" class="settings-card">
+            <div class="settings-section">
+              <div class="setting-heading"><h3>SnowLuma</h3><span id="credential-status" class="credential-status"></span></div>
+              <div class="field"><label for="ws-url">WebSocket 地址</label><input id="ws-url" name="wsUrl" type="url" placeholder="ws://127.0.0.1:3000/" required autocomplete="off"><span class="field-help">使用 SnowLuma 的 Universal WebSocket 端点。</span></div>
+              <div class="field"><label for="token-env">Token 环境变量</label><input id="token-env" name="accessTokenEnv" type="text" required pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off"><span id="credential-source" class="field-help">填写变量名，凭据由本地服务读取。</span></div>
+            </div>
+            <div class="settings-section">
+              <h3>聚合节奏</h3>
+              <div class="timing-grid">
+                <div class="field"><label for="quiet-ms">静默等待<span class="unit">毫秒</span></label><input id="quiet-ms" name="quietMs" type="number" min="0" max="3600000" step="1" required><span class="field-help">发言暂歇后，合并为一次通知。</span></div>
+                <div class="field"><label for="max-wait-ms">最长等待<span class="unit">毫秒</span></label><input id="max-wait-ms" name="maxWaitMs" type="number" min="1" max="3600000" step="1" required><span class="field-help">连续发言时的聚合时长。</span></div>
+                <div class="field"><label for="min-interval-ms">通知间隔<span class="unit">毫秒</span></label><input id="min-interval-ms" name="minIntervalMs" type="number" min="0" max="3600000" step="1" required><span class="field-help">两次唤醒 Pi 的最小间隔。</span></div>
+              </div>
+            </div>
+            <div class="editor-footer"><span id="config-state" class="save-state">已保存</span><button id="save-config" class="button save-button" type="submit" disabled>保存设置</button></div>
+          </form>
+        </section>
+
+        <section id="panel-model" class="tab-panel" role="tabpanel" aria-labelledby="tab-model" hidden>
+          <div class="section-intro"><div><h2>模型与思考</h2><p>设置按对话组保存，可直接应用到运行中的 Pi。</p></div></div>
+          <p id="model-runtime" class="model-runtime" role="status" aria-live="polite">正在读取当前会话…</p>
+          <form id="model-form" class="settings-card">
+            <div class="settings-section">
+              <div class="field"><label for="model-choice">本对话组模型</label><select id="model-choice" disabled><option value="">沿用 Pi / 当前会话</option></select><span class="field-help">每个对话组可以单独选择，也可以继续使用当前会话的模型。</span></div>
+              <div class="field"><label for="thinking-choice">思考强度</label><select id="thinking-choice" disabled><option value="">沿用 Pi</option></select><span class="field-help">选项随模型支持的思考强度变化。</span></div>
+              <p id="model-error" class="inline-error" role="alert" hidden></p>
+            </div>
+            <div class="editor-footer"><span id="model-state" class="save-state">正在读取…</span><button id="save-model" class="button save-button" type="submit" disabled>保存选择</button></div>
+          </form>
+          <p class="footnote">当前已发出的请求继续完成；之后的模型请求使用新设置。也可在终端使用 Pi 的 /model 和思考强度快捷键。</p>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="add-dialog" class="add-dialog" aria-labelledby="add-title">
+    <form id="add-form">
+      <div class="dialog-heading"><h2 id="add-title">新建对话组</h2><button id="close-add" class="icon-button" type="button" aria-label="关闭">×</button></div>
+      <p class="dialog-description">为相关对话创建共用的配置、文档和 Pi 会话。</p>
+      <div class="field"><label for="new-group-name">对话组名称</label><input id="new-group-name" name="name" type="text" maxlength="80" required autocomplete="off" placeholder="例如 朋友们"></div>
+      <div class="field"><label for="new-group-id">目录标识（可留空）</label><input id="new-group-id" name="id" type="text" maxlength="64" pattern="[a-z0-9][a-z0-9_\-]{0,63}" autocomplete="off" placeholder="留空自动生成"><span class="field-help">可填写小写字母、数字、下划线或短横线；创建后保持固定。</span></div>
+      <div class="dialog-conversations"><h3>初始对话</h3><div id="new-conversation-rows" class="conversation-rows" aria-label="新对话组中的对话"></div><button id="add-new-conversation" class="button subtle" type="button">添加对话</button><p class="field-help membership-help">可以添加多个群聊和私聊，也可以创建后再添加。</p></div>
+      <div class="field"><label for="new-ws-url">WebSocket 地址</label><input id="new-ws-url" name="wsUrl" type="url" required autocomplete="off"></div>
+      <p id="add-error" class="inline-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button id="cancel-add" class="button subtle" type="button">取消</button><button id="confirm-add" class="button primary" type="submit">创建对话组</button></div>
+    </form>
+  </dialog>
+</body>
+</html>
