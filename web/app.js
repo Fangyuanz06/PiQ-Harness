@@ -801,14 +801,29 @@ function parseMessages(content, expectedConversation) {
     try {
       const record = JSON.parse(line);
       if (!record || record.v !== 2 || !Number.isSafeInteger(record.seq) || record.seq < 1
-        || typeof record.receivedAt !== 'number' || !Number.isFinite(record.receivedAt)
-        || typeof record.messageId !== 'string' || typeof record.rawText !== 'string'
+        || typeof record.receivedAt !== 'number' || !Number.isFinite(record.receivedAt) || record.receivedAt < 0
+        || typeof record.rawText !== 'string'
         || !record.conversation || !['group', 'private', 'temporary'].includes(record.conversation.type)
         || typeof record.conversation.id !== 'string' || !/^[1-9]\d*$/.test(record.conversation.id)
         || !Number.isSafeInteger(Number(record.conversation.id))
         || (record.conversation.type === 'temporary' && (typeof record.conversation.sourceGroupId !== 'string'
           || !/^[1-9]\d*$/.test(record.conversation.sourceGroupId) || !Number.isSafeInteger(Number(record.conversation.sourceGroupId))))
         || conversationKey(record.conversation) !== expectedConversation || !Array.isArray(record.segments)) throw new Error();
+      if (record.kind === 'poke') {
+        const qqId = value => typeof value === 'string' && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
+        if (!['group', 'private'].includes(record.conversation.type)
+          || typeof record.eventId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(record.eventId)
+          || !['notice', 'action'].includes(record.source)
+          || !qqId(record.userId) || !qqId(record.selfId) || !qqId(record.targetId)
+          || typeof record.time !== 'number' || !Number.isFinite(record.time) || record.time < 0
+          || typeof record.sender !== 'string' || typeof record.outgoing !== 'boolean'
+          || record.outgoing !== (record.userId === record.selfId)
+          || (record.source === 'action' && !record.outgoing)
+          || 'messageId' in record || 'messageSeq' in record
+          || 'groupId' in record || 'sourceGroupId' in record || 'sourceGroupId' in record.conversation
+          || record.segments.some(segment => !segment || typeof segment.type !== 'string' || !segment.type
+            || !segment.data || typeof segment.data !== 'object' || Array.isArray(segment.data))) throw new Error();
+      } else if ((record.kind !== undefined && record.kind !== 'message') || typeof record.messageId !== 'string') throw new Error();
       return record;
     } catch { throw new Error(`JSONL 日志第 ${index + 1} 条记录无效，请检查文件。`); }
   });
@@ -825,22 +840,27 @@ function renderMessages(content, truncated) {
   list.hidden = !records.length;
   $('log-note').textContent = truncated ? `显示末尾 ${records.length} 条完整记录` : records.length ? `${records.length} 条记录` : '';
   for (const record of records) {
+    const poke = record.kind === 'poke';
     const article = document.createElement('article'); article.className = 'message-entry';
     const meta = document.createElement('div'); meta.className = 'message-meta';
     const source = document.createElement('span'); source.className = 'message-source';
     const known = state.detail.config.conversations.find(conversation => conversationKey(conversation) === conversationKey(record.conversation));
     source.textContent = conversationLabel(known || record.conversation);
     const sender = document.createElement('span'); sender.className = 'message-author'; sender.textContent = record.sender || record.userId || '未知发送人';
-    const id = document.createElement('span'); id.textContent = record.messageId ? `#${record.messageId}` : '';
+    const id = document.createElement('span'); id.textContent = poke ? '戳一戳' : record.messageId ? `#${record.messageId}` : '';
     const time = document.createElement('time'); time.className = 'message-time';
     const date = new Date(Number(record.time) * 1000);
     time.textContent = Number.isFinite(date.getTime()) ? date.toLocaleTimeString('zh-CN', { hour12: false }) : '';
     meta.append(source, sender);
-    if (record.outgoing) { const sent = document.createElement('span'); sent.className = 'message-direction'; sent.textContent = '已发送'; meta.append(sent); }
+    if (poke || record.outgoing) {
+      const sent = document.createElement('span'); sent.className = 'message-direction';
+      sent.textContent = poke ? record.source === 'action' ? '已发起' : '事件通知' : '已发送'; meta.append(sent);
+    }
     meta.append(id, time);
-    const text = document.createElement('div'); text.className = 'message-text'; text.textContent = record.rawText || '（非文字消息）';
+    const text = document.createElement('div'); text.className = 'message-text';
+    text.textContent = poke ? `${record.userId} 戳了 ${record.targetId}` : record.rawText || '（非文字消息）';
     article.append(meta, text);
-    const attachments = Array.isArray(record.segments) ? record.segments.filter(segment => segment?.type && segment.type !== 'text') : [];
+    const attachments = !poke && Array.isArray(record.segments) ? record.segments.filter(segment => segment?.type && segment.type !== 'text') : [];
     if (attachments.length) {
       const extra = document.createElement('div'); extra.className = 'message-attachments';
       const labels = { image: '图片', face: '表情', reply: '引用', at: '提及', file: '文件', record: '语音', video: '视频', forward: '转发' };

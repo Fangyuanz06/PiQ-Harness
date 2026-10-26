@@ -33,6 +33,14 @@ function logRecord(seq: number, text = '测试消息', changes: Record<string, u
     segments: [{ type: 'text', data: { text } }], outgoing: false, ...changes };
 }
 
+function pokeRecord(seq: number, changes: Record<string, unknown> = {}) {
+  return { v: 2, seq, receivedAt: 1793000000000 + seq, kind: 'poke',
+    eventId: '4b5f875c-818b-4580-9445-505c43a832a0', source: 'notice',
+    conversation: { type: 'group', id: '123456' }, selfId: '111111', userId: '222222', targetId: '111111',
+    sender: '222222', time: 1793000000, rawText: '222222 戳了 111111',
+    segments: [{ type: 'poke', data: { user_id: '222222', target_id: '111111' } }], outgoing: false, ...changes };
+}
+
 const logLine = (record: ReturnType<typeof logRecord>) => JSON.stringify(record) + '\n';
 
 async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }) {
@@ -181,6 +189,43 @@ test('JSONL logs are read-only, preserve multiline content, and exclude Markdown
   assert.equal((await f.call('/api/groups/123456/logs/2026-10-25.jsonl')).status, 404);
   assert.equal((await f.call('/api/groups/123456/logs/group:123456/2026-10-25.jsonl', 'PUT', { content: 'replacement' })).status, 404);
   assert.equal(await readFile(join(f.messageDir, '2026-10-25.jsonl'), 'utf8'), older);
+});
+
+test('mixed message and poke journals retain explicit events and isolated conversation routes', async t => {
+  const f = await fixture(t);
+  const path = join(f.messageDir, '2026-10-26.jsonl');
+  const route = '/api/groups/123456/logs/group:123456/2026-10-26.jsonl';
+  const records = [logRecord(1), pokeRecord(2), pokeRecord(3, {
+    eventId: 'd0a3ca10-0d11-4f38-9626-ea66925be84c', source: 'action', userId: '111111', targetId: '222222', outgoing: true,
+  })];
+  const content = records.map(record => JSON.stringify(record) + '\n').join('');
+  await writeFile(path, content);
+  assert.deepEqual(await f.get(route), { content, truncated: false });
+  assert.deepEqual((await f.get<Group>('/api/groups/123456')).logs['group:123456'], ['2026-10-26.jsonl']);
+  assert.equal('messageId' in records[1]!, false);
+  assert.equal('messageSeq' in records[1]!, false);
+  await writeFile(path, JSON.stringify(pokeRecord(2, { conversation: { type: 'private', id: '123456' } })) + '\n');
+  const mismatch = await f.call(route);
+  assert.equal(mismatch.status, 400, await mismatch.clone().text());
+  assert.match((await mismatch.json() as { error: string }).error, /来源对话/);
+});
+
+test('poke journals reject malformed identities and invented message identifiers without modifying the log', async t => {
+  const f = await fixture(t);
+  const path = join(f.messageDir, '2026-10-26.jsonl');
+  const route = '/api/groups/123456/logs/group:123456/2026-10-26.jsonl';
+  for (const changes of [
+    { eventId: 'not-an-event-id' }, { source: 'unknown' }, { source: 'action' },
+    { targetId: '' }, { userId: '-1' }, { outgoing: true },
+    { messageId: '-123' }, { messageSeq: '123' }, { kind: 'unknown' },
+    { conversation: { type: 'temporary', sourceGroupId: '123456', id: '222222' } },
+  ]) {
+    const content = JSON.stringify(pokeRecord(1, changes)) + '\n';
+    await writeFile(path, content);
+    const response = await f.call(route);
+    assert.equal(response.status, 400, await response.clone().text());
+    assert.equal(await readFile(path, 'utf8'), content);
+  }
 });
 
 test('large JSONL logs return a bounded tail made only of complete records', async t => {

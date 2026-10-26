@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { GroupStore, parseStoredMessage, type IncomingRecord, type StoredMessage } from "../src/store.ts";
+import { GroupStore, parseStoredMessage, parseStoredRecord, type IncomingRecord, type StoredMessage, type StoredPoke } from "../src/store.ts";
 import type { Conversation } from '../src/conversations.ts';
+import type { PokeEvent } from '../src/transport.ts';
 
 const group: Conversation = { type: 'group', id: '123456' };
 const privateChat: Conversation = { type: 'private', id: '123456' };
@@ -26,6 +28,16 @@ function message(id = "-1", changes: Partial<IncomingRecord> = {}): IncomingReco
 
 function stored(seq = 1, changes: Partial<StoredMessage> = {}): StoredMessage {
   return { ...message(String(seq)), v: 2, seq, receivedAt: 1793000000000, ...changes };
+}
+
+function poke(changes: Partial<PokeEvent> = {}): PokeEvent {
+  return {
+    kind: 'poke', eventId: randomUUID(), source: 'notice', conversation: group,
+    userId: '234567', selfId: '345678', targetId: '345678', sender: '234567',
+    time: 1793000000, rawText: '234567 戳了戳 345678',
+    segments: [{ type: 'poke', data: { user_id: '234567', target_id: '345678' } }], outgoing: false,
+    ...changes,
+  };
 }
 
 test("journals recover pending messages and deduplication after restart", async () => {
@@ -436,4 +448,147 @@ test('temporary records require their source group in the conversation identity 
     await writeFile(path.join(directory, '2026-10-26.jsonl'), JSON.stringify(stored(1, { conversation: temp })) + '\n');
     await assert.rejects(GroupStore.open(cwd, { id: config.id, conversations: [temp] }), /another conversation/);
   } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('poke events retain consecutive same-second actions and recover notification watermarks', async () => {
+  const cwd = await temporary();
+  let store = await GroupStore.open(cwd, config);
+  const first = poke(), second = poke();
+  try {
+    assert.equal(await store.appendPoke(first), true);
+    assert.equal(await store.appendPoke(first), false);
+    assert.equal(await store.appendPoke(second), true);
+    assert.equal(first.time, second.time);
+    assert.equal(first.rawText, second.rawText);
+    const pending = store.pending()!;
+    assert.equal(pending.count, 2);
+    assert.equal(pending.through, 2);
+    assert.deepEqual(pending.conversations.map(({ count, firstSeq, lastSeq }) => ({ count, firstSeq, lastSeq })), [
+      { count: 2, firstSeq: 1, lastSeq: 2 },
+    ]);
+    const entries = (await readFile(path.join(cwd, pending.files[0]!), 'utf8')).trimEnd().split('\n').map(line => parseStoredRecord(line));
+    assert.deepEqual(entries.map(record => record.seq), [1, 2]);
+    assert.deepEqual(entries.map(record => record.kind), ['poke', 'poke']);
+    assert.equal(entries.some(record => 'messageId' in record || 'messageSeq' in record), false);
+    assert.throws(() => parseStoredMessage(JSON.stringify(entries[0])), /Expected a QQ message/);
+    assert.equal(await store.freezeHistoryCursor(group), null);
+    await store.acknowledge(1, 123456789);
+    await store.close();
+    store = await GroupStore.open(cwd, config);
+    assert.equal(await store.appendPoke(first), false);
+    assert.equal(await store.appendPoke(second), false);
+    assert.equal(store.pending()!.count, 1);
+    assert.equal(store.pending()!.through, 2);
+    assert.equal(store.lastNotifiedAt, 123456789);
+    assert.equal(await store.freezeHistoryCursor(group), null);
+    await store.acknowledge(2);
+    assert.equal(store.pending(), null);
+  } finally { await store.close(); await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('mixed poke and message journals keep one sequence without advancing history through pokes', async () => {
+  const cwd = await temporary();
+  let store = await GroupStore.open(cwd, config);
+  try {
+    await store.append(message('9', { messageSeq: '9', time: 100 }));
+    await store.appendPoke(poke({ time: 200 }));
+    await store.append(message('10', { messageSeq: '10', time: 101 }));
+    await store.appendPoke(poke({ time: 300 }));
+    const pending = store.pending()!;
+    assert.equal(pending.count, 4);
+    assert.equal(pending.through, 4);
+    const entries = (await readFile(path.join(cwd, pending.files[0]!), 'utf8')).trimEnd().split('\n').map(line => parseStoredRecord(line));
+    assert.deepEqual(entries.map(record => record.seq), [1, 2, 3, 4]);
+    assert.deepEqual(entries.map(record => record.messageId), ['9', undefined, '10', undefined]);
+    await store.close();
+    store = await GroupStore.open(cwd, config);
+    assert.deepEqual(await store.freezeHistoryCursor(group), { messageId: '10', messageSeq: '10', time: 101 });
+    assert.equal(store.pending()!.count, 4);
+  } finally { await store.close(); await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('successful local pokes and their server notices are retained without self wakeups or heuristic merging', async () => {
+  const cwd = await temporary();
+  let store = await GroupStore.open(cwd, { id: config.id, conversations: [privateChat] });
+  try {
+    const action = poke({ source: 'action', conversation: privateChat, userId: '345678', targetId: privateChat.id, outgoing: true });
+    const notice = { ...action, source: 'notice' as const, eventId: randomUUID() };
+    assert.equal(await store.appendPoke(action), true);
+    assert.equal(await store.appendPoke(notice), true);
+    assert.equal(store.pending(), null);
+    assert.equal(await store.freezeHistoryCursor(privateChat), null);
+    await store.close();
+    store = await GroupStore.open(cwd, { id: config.id, conversations: [privateChat] });
+    assert.equal(store.pending(), null);
+    assert.equal(await store.appendPoke(action), false);
+    const directory = path.join(cwd, 'messages', 'private', privateChat.id);
+    const entries = (await readFile(path.join(directory, (await readdir(directory))[0]!), 'utf8')).trimEnd().split('\n').map(line => parseStoredRecord(line));
+    assert.deepEqual(entries.map(record => record.kind === 'poke' ? record.source : undefined), ['action', 'notice']);
+    assert.equal(entries.length, 2);
+  } finally { await store.close(); await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('poke identities and files remain scoped to the configured conversation and account', async () => {
+  const cwd = await temporary();
+  const store = await GroupStore.open(cwd, { id: config.id, conversations: [group, privateChat] });
+  try {
+    const first = poke();
+    assert.equal(await store.appendPoke(first), true);
+    assert.equal(await store.appendPoke({ ...first, conversation: privateChat }), true);
+    assert.equal(await store.appendPoke({ ...first, selfId: '456789', targetId: '456789' }), true);
+    await assert.rejects(store.appendPoke({ ...first, conversation: { type: 'group', id: '999999' } }), /does not belong/);
+    const pending = store.pending()!;
+    assert.deepEqual(pending.conversations.map(({ conversation, count }) => ({ conversation, count })), [
+      { conversation: group, count: 2 }, { conversation: privateChat, count: 1 },
+    ]);
+    assert.match(pending.conversations[0]!.files[0]!, /^messages\/group\/123456\//);
+    assert.match(pending.conversations[1]!.files[0]!, /^messages\/private\/123456\//);
+  } finally { await store.close(); await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('poke validation rejects invented message identities, malformed actors and mismatched directions', async () => {
+  const cwd = await temporary();
+  const store = await GroupStore.open(cwd, config);
+  const base = poke();
+  try {
+    const invalid: unknown[] = [
+      null, [], { ...base, kind: 'other' }, { ...base, eventId: '' }, { ...base, eventId: 'not-a-uuid' },
+      { ...base, source: 'history' }, { ...base, source: 'action' },
+      { ...base, messageId: '1' }, { ...base, messageSeq: '1' },
+      { ...base, userId: '0' }, { ...base, userId: 123 }, { ...base, userId: '9007199254740992' },
+      { ...base, selfId: 'self' }, { ...base, targetId: '../escape' }, { ...base, targetId: '' },
+      { ...base, outgoing: true }, { ...base, outgoing: undefined }, { ...base, userId: base.selfId },
+      { ...base, time: -1 }, { ...base, time: '123' }, { ...base, sender: 123 },
+      { ...base, rawText: undefined }, { ...base, segments: [{ type: 'poke', data: [] }] },
+      { ...base, groupId: group.id }, { ...base, sourceGroupId: '123' },
+      { ...base, conversation: { type: 'temporary', id: '123456', sourceGroupId: '555' } },
+    ];
+    for (const value of invalid) {
+      await assert.rejects(store.appendPoke(value as PokeEvent));
+      assert.throws(() => parseStoredRecord(JSON.stringify(value === null ? null : { ...value as object, v: 2, seq: 1, receivedAt: 1 }), 'poke.jsonl:7'), /Invalid JSONL message in poke\.jsonl:7/);
+    }
+    await assert.rejects(store.appendPoke({ ...base, messageId: undefined } as unknown as PokeEvent));
+    await assert.rejects(store.append(base as unknown as IncomingRecord), /Invalid message kind/);
+    await assert.rejects(store.appendPoke(message() as unknown as PokeEvent), /Invalid poke kind/);
+    assert.equal(store.pending(), null);
+  } finally { await store.close(); await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('local poke metadata is assigned by the journal and closing drains accepted events', async () => {
+  const cwd = await temporary();
+  const store = await GroupStore.open(cwd, config);
+  try {
+    const writing = store.appendPoke({ ...poke(), v: 999, seq: 500, receivedAt: -1 } as PokeEvent);
+    await store.close();
+    assert.equal(await writing, true);
+    await assert.rejects(store.appendPoke(poke()), /closed/);
+    const reopened = await GroupStore.open(cwd, config);
+    try {
+      const record = parseStoredRecord((await readFile(path.join(cwd, reopened.pending()!.files[0]!), 'utf8')).trimEnd()) as StoredPoke;
+      assert.equal(record.kind, 'poke');
+      assert.equal(record.v, 2);
+      assert.equal(record.seq, 1);
+      assert.ok(record.receivedAt > 0);
+    } finally { await reopened.close(); }
+  } finally { await store.close(); await rm(cwd, { recursive: true, force: true }); }
 });

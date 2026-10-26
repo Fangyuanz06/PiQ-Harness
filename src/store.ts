@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
-import { compareCursors, messageCursor, type HistoryCursor } from './transport.ts';
+import { compareCursors, messageCursor, type HistoryCursor, type PokeEvent } from './transport.ts';
 import { conversationKey, parseConversationKey, validateConversation, type Conversation } from './conversations.ts';
 import { validateGroupId, type GroupConfig } from './config.ts';
 
 export interface IncomingRecord {
+  kind?: 'message';
   messageId: string;
   messageSeq?: string;
   conversation: Conversation;
@@ -27,6 +28,16 @@ export interface StoredMessage extends IncomingRecord {
   receivedAt: number;
 }
 
+export interface StoredPoke extends PokeEvent {
+  v: 2;
+  seq: number;
+  receivedAt: number;
+  messageId?: never;
+  messageSeq?: never;
+}
+
+export type StoredRecord = StoredMessage | StoredPoke;
+
 export interface PendingMessages {
   count: number;
   firstAt: number;
@@ -42,9 +53,9 @@ interface Receipt {
   key: string;
   at: number;
   incoming: boolean;
-  messageId: string;
+  messageId?: string;
   file: string;
-  remote: HistoryCursor;
+  remote?: HistoryCursor;
   conversation: Conversation;
 }
 
@@ -190,6 +201,7 @@ function validateCursor(value: unknown): asserts value is HistoryCursor | null {
 
 function validateRecord(value: unknown): asserts value is IncomingRecord {
   if (!object(value)) throw new Error('Message must be an object.');
+  if (value.kind !== undefined && value.kind !== 'message') throw new Error('Invalid message kind.');
   if (!object(value.conversation) || typeof value.conversation.id !== 'string') throw new Error('Message conversation ID must be a string.');
   if (value.conversation.type === 'temporary' && typeof value.conversation.sourceGroupId !== 'string') {
     throw new Error('Temporary conversation source group must be a string.');
@@ -212,8 +224,34 @@ function validateRecord(value: unknown): asserts value is IncomingRecord {
   }
 }
 
-function receiptKey(record: IncomingRecord): string {
+function validatePoke(value: unknown): asserts value is PokeEvent {
+  if (!object(value) || value.kind !== 'poke') throw new Error('Invalid poke kind.');
+  if ('messageId' in value || 'messageSeq' in value) throw new Error('Pokes do not have QQ message IDs or sequences.');
+  if (value.source !== 'notice' && value.source !== 'action') throw new Error('Invalid poke source.');
+  if (typeof value.eventId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.eventId)) {
+    throw new Error('Poke event ID must be a local UUID.');
+  }
+  if (!object(value.conversation) || typeof value.conversation.id !== 'string'
+    || !['group', 'private'].includes(String(value.conversation.type))) throw new Error('Invalid poke conversation.');
+  validateConversation(value.conversation);
+  if ('groupId' in value || 'sourceGroupId' in value) throw new Error('Pokes must use an explicit conversation.');
+  for (const field of ['userId', 'selfId', 'targetId']) {
+    const identifier = value[field];
+    if (typeof identifier !== 'string' || !/^[1-9]\d*$/.test(identifier) || !Number.isSafeInteger(Number(identifier))) {
+      throw new Error('Poke user IDs must be positive integer strings.');
+    }
+  }
+  if (typeof value.time !== 'number' || !Number.isFinite(value.time) || value.time < 0) throw new Error('Invalid poke time.');
+  if (typeof value.outgoing !== 'boolean' || value.outgoing !== (value.userId === value.selfId)) throw new Error('Invalid poke direction.');
+  if (value.source === 'action' && !value.outgoing) throw new Error('A local poke action must be outgoing.');
+  if (typeof value.sender !== 'string' || typeof value.rawText !== 'string'
+    || !Array.isArray(value.segments) || value.segments.some(segment => !object(segment)
+      || typeof segment.type !== 'string' || !segment.type || !object(segment.data))) throw new Error('Invalid poke content.');
+}
+
+function receiptKey(record: IncomingRecord | PokeEvent): string {
   const identity = conversationKey(record.conversation);
+  if (record.kind === 'poke') return `${identity}:self:${record.selfId}:poke:${record.eventId}`;
   const scope = record.conversation.type !== 'group' ? `${identity}:self:${record.selfId}:sender:${record.userId}` : identity;
   return record.messageSeq === undefined
     ? `${scope}:id:${record.messageId}:time:${record.time}`
@@ -235,26 +273,32 @@ function conversationPath(conversation: Conversation): string {
     : `messages/${conversation.type}/${conversation.id}`;
 }
 
-export function parseStoredMessage(line: string, filename = 'message record'): StoredMessage {
+export function parseStoredRecord(line: string, filename = 'message record'): StoredRecord {
   try {
     const value: unknown = JSON.parse(line);
-    validateRecord(value);
-    const stored = value as Partial<StoredMessage>;
+    if (object(value) && value.kind === 'poke') validatePoke(value); else validateRecord(value);
+    const stored = value as Partial<StoredRecord>;
     if (stored.v !== 2 || !Number.isSafeInteger(stored.seq) || (stored.seq ?? 0) < 1
       || typeof stored.receivedAt !== 'number' || !Number.isFinite(stored.receivedAt) || stored.receivedAt < 0) {
       throw new Error('Invalid local message metadata.');
     }
-    return value as StoredMessage;
+    return value as StoredRecord;
   } catch (cause) {
     throw new Error(`Invalid JSONL message in ${filename}; restore or repair this journal before continuing.`, { cause });
   }
 }
 
-function receiptFor(record: StoredMessage, filename: string): Receipt {
+export function parseStoredMessage(line: string, filename = 'message record'): StoredMessage {
+  const record = parseStoredRecord(line, filename);
+  if (record.kind === 'poke') throw new Error(`Expected a QQ message in ${filename}, received a poke event.`);
+  return record;
+}
+
+function receiptFor(record: StoredRecord, filename: string): Receipt {
   return {
     seq: record.seq, key: receiptKey(record), at: record.receivedAt,
     incoming: !record.outgoing && record.userId !== record.selfId,
-    messageId: record.messageId, file: filename, remote: messageCursor(record),
+    ...(record.kind === 'poke' ? {} : { messageId: record.messageId, remote: messageCursor(record) }), file: filename,
     conversation: conversationRef(record.conversation),
   };
 }
@@ -328,6 +372,7 @@ export class GroupStore {
       for (const receipt of this.receipts) {
         if (conversationKey(receipt.conversation) !== key) continue;
         const cursor = receipt.remote;
+        if (!cursor) continue;
         if (!latest || compareCursors(cursor, latest, conversation.type) >= 0) latest = cursor;
       }
       await this.writeHistoryCursor(key, latest);
@@ -379,18 +424,26 @@ export class GroupStore {
   }
 
   append(record: IncomingRecord): Promise<boolean> {
+    return this.appendRecord(record, false);
+  }
+
+  appendPoke(record: PokeEvent): Promise<boolean> {
+    return this.appendRecord(record, true);
+  }
+
+  private appendRecord(record: IncomingRecord | PokeEvent, poke: boolean): Promise<boolean> {
     if (this.closing) return Promise.reject(new Error("Group store is closed."));
     return this.enqueue(async () => {
       if (this.writeFault) throw this.writeFault;
-      validateRecord(record);
+      if (poke) validatePoke(record); else validateRecord(record);
       this.memberKey(record.conversation);
       const key = receiptKey(record);
       if (this.keys.has(key)) return false;
       const at = Date.now();
       const incoming = !record.outgoing && record.userId !== record.selfId;
-      const ownIdentity = ownKey(record);
-      const previousOwn = this.ownIds.get(ownIdentity);
-      if (!incoming && previousOwn && Math.abs(at - previousOwn.at) <= OWN_ECHO_WINDOW_MS
+      const ownIdentity = record.kind === 'poke' ? undefined : ownKey(record);
+      const previousOwn = ownIdentity === undefined ? undefined : this.ownIds.get(ownIdentity);
+      if (record.kind !== 'poke' && ownIdentity !== undefined && !incoming && previousOwn && Math.abs(at - previousOwn.at) <= OWN_ECHO_WINDOW_MS
         && (record.messageSeq === undefined || previousOwn.messageSeq === undefined || record.messageSeq === previousOwn.messageSeq)) {
         // A confirmed local send has no QQ sequence yet. Remember its echo's
         // sequence so another message with a colliding 32-bit ID stays distinct.
@@ -399,12 +452,15 @@ export class GroupStore {
       }
       const directoryName = conversationPath(record.conversation);
       const filename = `${directoryName}/${journalDate(at)}.jsonl`;
-      const stored: StoredMessage = {
-        v: 2, seq: (this.receipts.at(-1)?.seq ?? 0) + 1, receivedAt: at,
-        messageId: record.messageId, messageSeq: record.messageSeq, conversation: conversationRef(record.conversation),
+      const common = {
+        v: 2 as const, seq: (this.receipts.at(-1)?.seq ?? 0) + 1, receivedAt: at,
+        conversation: conversationRef(record.conversation),
         userId: record.userId, selfId: record.selfId, sender: record.sender, time: record.time,
         rawText: record.rawText, segments: record.segments, outgoing: record.outgoing,
       };
+      const stored: StoredRecord = record.kind === 'poke'
+        ? { ...common, kind: 'poke', eventId: record.eventId, source: record.source, targetId: record.targetId }
+        : { ...common, messageId: record.messageId, messageSeq: record.messageSeq };
       const receipt = receiptFor(stored, filename);
       const entry = JSON.stringify(stored) + '\n';
       try {
@@ -433,7 +489,7 @@ export class GroupStore {
       }
       this.receipts.push(receipt);
       this.keys.add(key);
-      if (!incoming) this.ownIds.set(ownIdentity, { at, messageSeq: record.messageSeq });
+      if (record.kind !== 'poke' && ownIdentity !== undefined && !incoming) this.ownIds.set(ownIdentity, { at, messageSeq: record.messageSeq });
       return true;
     });
   }
@@ -503,7 +559,7 @@ export class GroupStore {
         throw new Error("PiQ journals have duplicate or missing message sequences; restore or repair them before continuing.");
       }
       this.keys.add(receipt.key);
-      if (!receipt.incoming) this.ownIds.set(ownKey(receipt), { at: receipt.at, messageSeq: receipt.remote.messageSeq });
+      if (!receipt.incoming && receipt.remote) this.ownIds.set(ownKey({ conversation: receipt.conversation, messageId: receipt.remote.messageId }), { at: receipt.at, messageSeq: receipt.remote.messageSeq });
     }
     const filename = path.join(this.cwd, ".piq", "state.json");
     let saved: Partial<State>;
@@ -540,7 +596,7 @@ export class GroupStore {
       }
       const lines = contents ? contents.slice(0, -1).split('\n') : [];
       for (let index = 0; index < lines.length; index++) {
-        const record = parseStoredMessage(lines[index]!, `${relative}:${index + 1}`);
+        const record = parseStoredRecord(lines[index]!, `${relative}:${index + 1}`);
         if (conversationKey(record.conversation) !== conversationKey(conversation)) {
           throw new Error(`Journal ${relative} contains a message from another conversation.`);
         }

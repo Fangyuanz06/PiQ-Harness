@@ -7,12 +7,15 @@ import { adoptTemporaryConversation, claimConversations, loadConfig, type GroupC
 import { conversationKey, parseConversationKey, type Conversation } from './conversations.ts';
 import { Notifier } from './notifier.ts';
 import { GroupStore } from './store.ts';
-import { SnowLumaTransport, type ConversationEvent } from './transport.ts';
+import { SnowLumaTransport, type ConversationEvent, type PokeEvent } from './transport.ts';
 import { HistorySync } from './history.ts';
 import { registerModelControl } from './model-control.ts';
 import { resolveGroupEnvironment } from './web-terminal.ts';
 import { RunController, type ConnectionState } from './run-control.ts';
 import { ensureSnowLuma } from './snowluma-service.ts';
+import { registerGroupFileTool } from './group-files.ts';
+import { registerAlbumTool } from './albums.ts';
+import { manageSticker } from './sticker-management.ts';
 
 const SIGNAL = 'piq:messages';
 
@@ -92,6 +95,42 @@ export default function piq(pi: ExtensionAPI): void {
     await history.receive(event);
   }
 
+  async function receivePoke(current: Binding, event: PokeEvent): Promise<void> {
+    if (!current.histories.has(conversationKey(event.conversation))) return;
+    current.selfId = event.selfId;
+    await current.store.appendPoke(event);
+    current.notifier.schedule();
+    current.control?.refresh();
+  }
+
+  function active(ctx: ExtensionContext): Binding {
+    const current = binding;
+    if (!current || current.closed || resolve(ctx.cwd) !== resolve(current.cwd)) throw new Error('当前会话未连接本对话组。');
+    if (current.control?.paused) throw new Error('PiQ 已暂停，请在 WebUI 恢复运行。');
+    return current;
+  }
+
+  function action(ctx: ExtensionContext, key: string, signal?: AbortSignal) {
+    const current = active(ctx);
+    const target = parseConversationKey(key);
+    if (!current.histories.has(conversationKey(target))) throw new Error('目标对话不属于当前对话组。');
+    const sendSignal = signal ? AbortSignal.any([signal, current.sendAbort.signal]) : current.sendAbort.signal;
+    return { current, target, sendSignal };
+  }
+
+  function resourceContext(ctx: ExtensionContext, key: string, signal?: AbortSignal) {
+    const { current, target, sendSignal } = action(ctx, key, signal);
+    return { cwd: current.cwd, conversation: target, signal: sendSignal, transport: current.transport };
+  }
+
+  async function rememberSend(current: Binding, target: Conversation, messageId: string, rawText: string, segments: ConversationEvent['segments']): Promise<string> {
+    try {
+      await current.store.append({ conversation: target, messageId, rawText, segments, outgoing: true,
+        selfId: current.selfId ?? 'self', userId: current.selfId ?? 'self', sender: 'Pi', time: Math.floor(Date.now() / 1000) });
+      return '';
+    } catch { return '；发送已成功，但本地日志写入失败，请勿因日志错误重发'; }
+  }
+
   function resumeIfReady(current: Binding): void {
     if (current.closed || !current.resumeTurn || current.control?.paused || !current.transport.isConnected || !current.ctx.isIdle()) return;
     current.resumeTurn = false;
@@ -169,6 +208,10 @@ export default function piq(pi: ExtensionAPI): void {
         onMessage: event => {
           if (current.closed) return;
           current.receiving = current.receiving.then(()=>receive(current,event)).catch(error=>current.notifier.fail(error));
+        },
+        onPoke: event => {
+          if (current.closed) return;
+          current.receiving = current.receiving.then(()=>receivePoke(current,event)).catch(error=>current.notifier.fail(error));
         },
         onStatus: status => {
           if (current.closed) return;
@@ -286,5 +329,118 @@ export default function piq(pi: ExtensionAPI): void {
       };
     },
   });
+  pi.registerTool({
+    name: 'qq_poke', label: 'QQ 戳一戳',
+    description: '在指定群聊中戳一个成员，或在好友私聊中戳对方。临时私聊不支持。只在明确调用时执行，结果未知时不要自动重试。',
+    parameters: Type.Object({
+      conversation: Type.String({ description: '本对话组内的目标对话标识。' }),
+      userId: Type.Optional(Type.String({ description: '群聊中必填目标成员 QQ；好友私聊默认对方，只能戳该对方。' })),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const { current, target, sendSignal } = action(ctx, params.conversation, signal);
+      const result = await current.transport.poke(target, params.userId, sendSignal);
+      current.selfId = result.selfId;
+      let warning = '';
+      try {
+        await current.store.appendPoke({ kind: 'poke', eventId: randomUUID(), source: 'action', conversation: target,
+          selfId: result.selfId, userId: result.selfId, targetId: result.userId, sender: 'Pi',
+          time: Math.floor(Date.now() / 1000), rawText: `${result.selfId} 戳了 ${result.userId}`, outgoing: true,
+          segments: [{ type: 'poke', data: { user_id: result.selfId, target_id: result.userId } }] });
+      } catch { warning = '；动作已成功，但本地日志写入失败，请勿因此重试'; }
+      return { content: [{ type: 'text', text: `已在 ${conversationKey(target)} 戳了 ${result.userId}${warning}` }],
+        details: { conversation: target, userId: result.userId, warning: warning || undefined } };
+    },
+  });
+  pi.registerTool({
+    name: 'qq_react', label: 'QQ 表情回应',
+    description: '为指定群消息添加或取消表情回应。仅支持群聊，messageId 是 QQ 消息 ID；emojiId 是 QQ 表情编号或后端接受的表情代码。',
+    parameters: Type.Object({
+      conversation: Type.String(), messageId: Type.Integer(), emojiId: Type.String(),
+      set: Type.Optional(Type.Boolean({ description: '默认 true 添加，false 取消。' })),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const { current, target, sendSignal } = action(ctx, params.conversation, signal);
+      await current.transport.react(target, params.messageId, params.emojiId, params.set ?? true, sendSignal);
+      return { content: [{ type: 'text', text: `已${params.set === false ? '取消' : '添加'} ${conversationKey(target)} 消息 ${params.messageId} 的表情回应 ${params.emojiId}` }],
+        details: { conversation: target, messageId: params.messageId, emojiId: params.emojiId, set: params.set ?? true } };
+    },
+  });
+  pi.registerTool({
+    name: 'qq_recall', label: '撤回 QQ 消息',
+    description: '撤回本账号在指定对话中发送的消息。使用 QQ messageId；会核验所属对话和发送者，QQ 时间窗口或权限限制可能导致失败。',
+    parameters: Type.Object({ conversation: Type.String(), messageId: Type.Integer() }),
+    async execute(_id, params, signal, _update, ctx) {
+      const { current, target, sendSignal } = action(ctx, params.conversation, signal);
+      await current.transport.recall(target, params.messageId, sendSignal);
+      return { content: [{ type: 'text', text: `已撤回 ${conversationKey(target)} 的消息 ${params.messageId}` }],
+        details: { conversation: target, messageId: params.messageId } };
+    },
+  });
+  pi.registerTool({
+    name: 'qq_sticker', label: 'QQ 收藏表情',
+    description: 'list 查询当前 QQ 账号的收藏表情；send 按 emojiId 发送到本组群聊或好友私聊，可引用消息。add 从本组 path 添加收藏，remove 删除，rename 用 name 改备注，promote 置顶。收藏管理影响本 QQ 账号的共用收藏；发送必须指定 conversation，临时私聊不支持。',
+    parameters: Type.Object({
+      action: Type.Union(['list', 'send', 'add', 'remove', 'rename', 'promote'].map(value => Type.Literal(value))),
+      conversation: Type.Optional(Type.String()), emojiId: Type.Optional(Type.String()),
+      replyTo: Type.Optional(Type.Integer()), count: Type.Optional(Type.Integer({ minimum: 0 })),
+      path: Type.Optional(Type.String()), name: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      if (params.action === 'list') {
+        const current = params.conversation ? action(ctx, params.conversation, signal).current : active(ctx);
+        const listSignal = signal ? AbortSignal.any([signal, current.sendAbort.signal]) : current.sendAbort.signal;
+        const stickers = await current.transport.listStickers(params.count ?? 48, listSignal);
+        return { content: [{ type: 'text', text: JSON.stringify(stickers) }], details: { stickers } };
+      }
+      if (params.action !== 'send') {
+        const current = params.conversation ? action(ctx, params.conversation, signal).current : active(ctx);
+        const resourceSignal = signal ? AbortSignal.any([signal, current.sendAbort.signal]) : current.sendAbort.signal;
+        const result = await current.transport.resources(request => manageSticker(request, current.cwd, {
+          action: params.action as 'add' | 'remove' | 'rename' | 'promote', path: params.path, emojiId: params.emojiId, name: params.name,
+        }, resourceSignal), resourceSignal);
+        return { content: [{ type: 'text', text: JSON.stringify(result) }], details: { result } };
+      }
+      if (!params.conversation || !params.emojiId) throw new Error('发送收藏表情需要 conversation 和 emojiId。');
+      const { current, target, sendSignal } = action(ctx, params.conversation, signal);
+      const result = await current.transport.sendSticker(target, params.emojiId, params.replyTo, sendSignal);
+      const warning = await rememberSend(current, target, result.messageId, '[收藏表情]', [
+        ...(params.replyTo === undefined ? [] : [{ type: 'reply', data: { id: String(params.replyTo) } }]),
+        { type: 'custom_face', data: { emoji_id: params.emojiId } },
+      ]);
+      return { content: [{ type: 'text', text: `已发送收藏表情到 ${conversationKey(target)}，message_id=${result.messageId}${warning}` }],
+        details: { conversation: target, ...result, emojiId: params.emojiId, warning: warning || undefined } };
+    },
+  });
+  pi.registerTool({
+    name: 'qq_voice', label: 'QQ AI 语音与转写',
+    description: 'list 查询指定群可用的 QQ AI 音色；send 使用 text 和 characterId 向该群发送 QQ AI 语音；transcribe 按 messageId 获取指定对话中语音消息的 QQ 转文字结果。群 AI 语音不支持好友或临时私聊。',
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal('list'), Type.Literal('send'), Type.Literal('transcribe')]),
+      conversation: Type.String(), text: Type.Optional(Type.String()), characterId: Type.Optional(Type.String()),
+      messageId: Type.Optional(Type.Integer()),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const { current, target, sendSignal } = action(ctx, params.conversation, signal);
+      if (params.action === 'list') {
+        const voices = await current.transport.getVoices(target, sendSignal);
+        return { content: [{ type: 'text', text: JSON.stringify(voices) }], details: { conversation: target, voices } };
+      }
+      if (params.action === 'transcribe') {
+        if (params.messageId === undefined) throw new Error('语音转文字需要 messageId。');
+        const result = await current.transport.transcribe(target, params.messageId, sendSignal);
+        return { content: [{ type: 'text', text: result.text || 'QQ 暂未返回语音转文字结果。' }],
+          details: { conversation: target, messageId: params.messageId, text: result.text } };
+      }
+      if (!params.text?.trim() || !params.characterId) throw new Error('发送 AI 语音需要 text 和 characterId。');
+      const result = await current.transport.speak(target, params.text, params.characterId, sendSignal);
+      const warning = await rememberSend(current, target, result.messageId, `[AI语音] ${params.text}`, [
+        { type: 'record', data: { text: params.text, character_id: params.characterId, provider: 'qq' } },
+      ]);
+      return { content: [{ type: 'text', text: `已发送 AI 语音到 ${conversationKey(target)}，message_id=${result.messageId}${warning}` }],
+        details: { conversation: target, ...result, characterId: params.characterId, warning: warning || undefined } };
+    },
+  });
+  registerGroupFileTool(pi, resourceContext);
+  registerAlbumTool(pi, resourceContext);
   registerModelControl(pi);
 }

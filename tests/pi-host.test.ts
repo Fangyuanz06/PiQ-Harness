@@ -15,11 +15,17 @@ import { initializeGroup, loadConfig } from '../src/config.ts';
 import { GroupStore } from '../src/store.ts';
 import { normalizeMessageEvent } from '../src/transport.ts';
 import { conversationKey, type Conversation } from '../src/conversations.ts';
+import { readRuntimeStatus, requestRunAction } from '../src/run-control.ts';
 
 /** Fake only the network boundary: Pi and SnowLuma both run their real implementations. */
 class LocalSocket extends EventTarget {
   static instances: LocalSocket[] = [];
   static history = new Map<string, Array<Record<string, unknown>>>();
+  static messages = new Map<number, Record<string, unknown>>();
+  static transcripts = new Map<number, string>();
+  static stickers = [{ emoji_id: 'sticker-001', md5: 'fake-sticker-md5', desc: 'Local test sticker' }];
+  static voices = [{ type: 'default', characters: [{ character_id: 'voice-001', character_name: 'Local test voice' }] }];
+  static nextMessageId = -900;
   readyState = 0;
   readonly url: string;
   sent: Array<{ action: string; params: Record<string, unknown>; echo: string }> = [];
@@ -43,8 +49,25 @@ class LocalSocket extends EventTarget {
     const messages = packet.params.message_id
       ? anchor < 0 ? [] : records.slice(anchor, anchor + packet.params.count)
       : records.slice(-packet.params.count);
-    const result = packet.action === 'get_login_info' ? { user_id: 99999, nickname: 'Test bot' }
-      : ['get_group_msg_history', 'get_friend_msg_history'].includes(packet.action) ? { messages } : { message_id: -900 };
+    let result: unknown;
+    if (packet.action === 'get_login_info') result = { user_id: 99999, nickname: 'Test bot' };
+    else if (['get_group_msg_history', 'get_friend_msg_history'].includes(packet.action)) result = { messages };
+    else if (packet.action === 'get_msg') result = LocalSocket.messages.get(packet.params.message_id) ?? null;
+    else if (packet.action === 'fetch_custom_face_detail') result = LocalSocket.stickers;
+    else if (packet.action === 'get_ai_characters') result = LocalSocket.voices;
+    else if (packet.action === 'fetch_ptt_text') result = { text: LocalSocket.transcripts.get(packet.params.message_id) ?? '' };
+    else if (packet.action === 'get_group_root_files') result = { files: [
+      { file_id: 'file-001', file_name: 'Local group file.txt', group_id: packet.params.group_id },
+    ], folders: [] };
+    else if (packet.action === 'create_group_file_folder') result = { ok: true };
+    else if (packet.action === 'get_qun_album_list') result = {
+      album_list: [{ album_id: 'album-001', name: 'Local group album', upload_number: 1 }], attach_info: '', has_more: false,
+    };
+    else if (packet.action === 'download_file') result = { file: '/backend/temporary-sticker.png' };
+    else if (packet.action === 'add_custom_face') result = { emoji_id: 'added-sticker-001' };
+    else if (['modify_custom_face', 'delete_custom_face', 'move_custom_face_to_front'].includes(packet.action)) result = null;
+    else if (['group_poke', 'friend_poke', 'set_msg_emoji_like', 'delete_msg'].includes(packet.action)) result = null;
+    else result = { message_id: LocalSocket.nextMessageId-- };
     queueMicrotask(() => this.receive({
       status: 'ok', retcode: 0, data: result, echo: packet.echo,
     }));
@@ -81,6 +104,18 @@ function temporaryMessage(groupId: string, userId: string, messageId: number, te
     sender: { nickname: 'Temporary member', group_id: Number(groupId) } };
 }
 
+function poke(overrides: Record<string, unknown> = {}) {
+  return { post_type: 'notice', notice_type: 'notify', sub_type: 'poke', self_id: 99999,
+    time: 1_700_000_100, user_id: 88888, target_id: 99999, ...overrides };
+}
+
+async function conversationRecords(cwd: string, conversation: Conversation): Promise<Array<Record<string, any>>> {
+  const directory = messagesDirectory(cwd, conversation);
+  const files = (await readdir(directory)).filter(file => file.endsWith('.jsonl'));
+  return (await Promise.all(files.map(file => readFile(join(directory, file), 'utf8'))))
+    .flatMap(contents => contents.trimEnd().split('\n').filter(Boolean).map(line => JSON.parse(line)));
+}
+
 const messagesDirectory = (cwd: string, conversation: Conversation) => join(cwd, 'messages', conversation.type, conversation.id);
 
 async function eventually(check: () => boolean | Promise<boolean>, description: string): Promise<void> {
@@ -96,6 +131,7 @@ async function fixture(t: TestContext) {
   process.env.PIQ_SNOWLUMA_AUTOSTART = '0';
   t.after(() => { if (oldAutostart === undefined) delete process.env.PIQ_SNOWLUMA_AUTOSTART; else process.env.PIQ_SNOWLUMA_AUTOSTART = oldAutostart; });
   LocalSocket.history.clear();
+  LocalSocket.messages.clear(); LocalSocket.transcripts.clear(); LocalSocket.nextMessageId = -900;
   // Windows Codex's virtualized OS temp denies rename; the channel uses atomic rename for receipts.
   const tempRoot = join(process.cwd(), '.test-tmp');
   await mkdir(tempRoot, { recursive: true });
@@ -449,4 +485,355 @@ test('temporary messages join their source group, stay in a separate log, and re
   assert.equal((await loadConfig(source.cwd))!.conversations.some(conversation => conversationKey(conversation) === `temporary:${sourceId}:${otherPeer}`), false);
   assert.deepEqual(source.errors, []); assert.deepEqual(source.notifications, []);
   assert.deepEqual(other.errors, []); assert.deepEqual(other.notifications, []);
+});
+
+test('real Pi explicitly pokes a group member or private peer and rejects unscoped destinations', async t => {
+  const f = await fixture(t);
+  const groupId = '444001';
+  const peerId = '444002';
+  const temporaryId = '444003';
+  const conversations: Conversation[] = [
+    { type: 'group', id: groupId }, { type: 'private', id: peerId },
+    { type: 'temporary', id: temporaryId, sourceGroupId: groupId },
+  ];
+  const tool = (parameters: Record<string, string>) => fauxAssistantMessage(fauxToolCall('qq_poke', parameters), { stopReason: 'toolUse' });
+  const host = await f.host('poke-actions', 'EXPLICIT_POKE_ACTIONS', [
+    tool({ conversation: `group:${groupId}`, userId: '88888' }),
+    tool({ conversation: `private:${peerId}` }),
+    tool({ conversation: 'group:555111', userId: '88888' }),
+    tool({ conversation: `group:${groupId}` }),
+    tool({ conversation: `temporary:${groupId}:${temporaryId}` }),
+    tool({ conversation: `private:${peerId}`, userId: '77777' }),
+    fauxAssistantMessage('The explicit pokes and rejected targets have been considered.'),
+  ], undefined, conversations);
+  assert.ok(host.session.getActiveToolNames().includes('qq_poke'));
+  await host.session.prompt('Exercise the explicit poke tool and its conversation boundaries.');
+
+  const actions = host.socket.sent.filter(packet => ['group_poke', 'friend_poke'].includes(packet.action));
+  assert.deepEqual(actions.map(packet => [packet.action, packet.params]), [
+    ['group_poke', { group_id: Number(groupId), user_id: 88888 }],
+    ['friend_poke', { user_id: Number(peerId) }],
+  ]);
+  const results = host.session.messages.filter(message => message.role === 'toolResult' && message.toolName === 'qq_poke');
+  assert.equal(results.length, 6);
+  assert.equal(results.filter(result => result.role === 'toolResult' && result.isError).length, 4);
+  assert.equal(host.socket.sent.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0);
+  for (const conversation of conversations.slice(0, 2)) {
+    const records = await conversationRecords(host.cwd, conversation);
+    assert.equal(records.length, 1);
+    const record = records[0]!;
+    assert.equal(record.kind, 'poke');
+    assert.equal(record.source, 'action');
+    assert.equal(record.outgoing, true);
+    assert.equal(record.userId, '99999');
+    assert.equal(record.targetId, conversation.type === 'group' ? '88888' : peerId);
+    assert.equal('messageId' in record, false);
+    assert.equal('messageSeq' in record, false);
+    assert.equal(typeof record.eventId, 'string');
+  }
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('poke notices share classified notifications and separate journals without moving message history', async t => {
+  const f = await fixture(t);
+  const groupId = '444004';
+  const peerId = '444005';
+  const temporaryId = '444006';
+  const conversations: Conversation[] = [
+    { type: 'group', id: groupId }, { type: 'private', id: peerId },
+    { type: 'temporary', id: temporaryId, sourceGroupId: groupId },
+  ];
+  const requests: string[] = [];
+  const host = await f.host('poke-notices', 'POKE_NOTICE_RULES', [context => {
+    requests.push(JSON.stringify(context));
+    return fauxAssistantMessage('The conversations are available to read if needed.');
+  }], undefined, conversations, 250);
+  const repeatedPoke = poke({ group_id: Number(groupId) });
+  host.socket.receive(repeatedPoke);
+  host.socket.receive(repeatedPoke);
+  host.socket.receive(privateMessage(peerId, 1, 'PRIVATE_BODY_READ_ONLY_ON_DEMAND'));
+  host.socket.receive(poke({ user_id: Number(peerId), sender_id: Number(peerId) }));
+  host.socket.receive(poke({ group_id: Number(groupId), user_id: 99999, target_id: 88888 }));
+  host.socket.receive(poke({ user_id: Number(peerId), sender_id: 99999, target_id: Number(peerId) }));
+  host.socket.receive(poke({ group_id: 555111 }));
+  // Without a group source, a private notice must not be assigned to a temporary conversation.
+  host.socket.receive(poke({ user_id: Number(temporaryId), sender_id: Number(temporaryId) }));
+  await eventually(() => host.faux.state.callCount === 1 && host.session.isIdle, 'one combined notice and message turn');
+
+  const signals = host.session.messages.filter(message => message.role === 'custom' && message.customType === 'piq:messages');
+  assert.equal(signals.length, 1);
+  const signal = signals[0]!;
+  assert.ok(signal.role === 'custom');
+  const details = signal.details as { conversations: Array<{ conversation: Conversation; count: number }> };
+  assert.deepEqual(details.conversations.map(item => [conversationKey(item.conversation), item.count]).sort(),
+    [[`group:${groupId}`, 2], [`private:${peerId}`, 2]].sort());
+  assert.doesNotMatch(JSON.stringify(signals), /PRIVATE_BODY_READ_ONLY_ON_DEMAND|戳了/);
+  assert.doesNotMatch(requests[0]!, /PRIVATE_BODY_READ_ONLY_ON_DEMAND|戳了/);
+  const groupRecords = await conversationRecords(host.cwd, conversations[0]!);
+  const privateRecords = await conversationRecords(host.cwd, conversations[1]!);
+  assert.equal(groupRecords.length, 3);
+  assert.equal(privateRecords.length, 3);
+  const incomingPokes = groupRecords.filter(record => record.kind === 'poke' && !record.outgoing);
+  assert.equal(incomingPokes.length, 2, 'two identical same-second reports remain separate events');
+  assert.notEqual(incomingPokes[0]!.eventId, incomingPokes[1]!.eventId);
+  for (const record of [...groupRecords, ...privateRecords].filter(record => record.kind === 'poke')) {
+    assert.equal(record.source, 'notice');
+    assert.equal('messageId' in record, false);
+    assert.equal('messageSeq' in record, false);
+    assert.equal(record.outgoing, record.userId === record.selfId);
+  }
+  assert.equal(privateRecords.find(record => record.kind === 'poke' && record.outgoing)!.userId, '99999',
+    'private notice sender_id identifies our own poke even when user_id is the peer');
+  const history = JSON.parse(await readFile(join(host.cwd, '.piq', 'history.json'), 'utf8'));
+  assert.equal(history.cursors[`group:${groupId}`], null);
+  assert.equal(history.cursors[`private:${peerId}`].messageId, '1');
+  assert.deepEqual((await loadConfig(host.cwd))!.conversations, conversations);
+
+  host.socket.receive(poke({ group_id: Number(groupId), user_id: 99999, target_id: 88888, time: 1_700_000_200 }));
+  await eventually(async () => (await conversationRecords(host.cwd, conversations[0]!)).length === 4, 'the own notice to be recorded');
+  await delay(350);
+  assert.equal(host.faux.state.callCount, 1, 'our own poke does not wake the agent again');
+  assert.equal(host.socket.sent.filter(packet => ['group_poke', 'friend_poke'].includes(packet.action)).length, 0,
+    'receiving a poke must not automatically poke back');
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('paused Pi records poke notices and refuses explicit poke actions until resumed', async t => {
+  const f = await fixture(t);
+  const groupId = '444007';
+  const host = await f.host('poke-paused', 'PAUSED_POKE_RULES', [
+    fauxAssistantMessage(fauxToolCall('qq_poke', { conversation: `group:${groupId}`, userId: '88888' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('The paused action was refused.'),
+    fauxAssistantMessage('The stored notice is now available.'),
+  ], undefined, [{ type: 'group', id: groupId }]);
+  const pause = await requestRunAction(host.cwd, 'pause');
+  await eventually(async () => (await readRuntimeStatus(host.cwd))?.requestId === pause.requestId, 'poke pause receipt');
+  host.socket.receive(poke({ group_id: Number(groupId) }));
+  await eventually(async () => (await readRuntimeStatus(host.cwd))?.pendingCount === 1, 'a poke recorded while paused');
+  await delay(150);
+  assert.equal(host.faux.state.callCount, 0);
+  await host.session.prompt('Check the paused qq_poke guard.');
+  assert.equal(host.socket.sent.filter(packet => ['group_poke', 'friend_poke'].includes(packet.action)).length, 0);
+  assert.match(JSON.stringify(host.session.messages), /PiQ 已暂停/);
+  const resume = await requestRunAction(host.cwd, 'resume');
+  await eventually(async () => (await readRuntimeStatus(host.cwd))?.requestId === resume.requestId, 'poke resume receipt');
+  await eventually(() => host.faux.state.callCount === 3 && host.session.isIdle, 'one resumed poke notice turn');
+  assert.equal(host.session.messages.filter(message => message.role === 'custom' && message.customType === 'piq:messages').length, 1);
+  const records = await conversationRecords(host.cwd, { type: 'group', id: groupId });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.kind, 'poke');
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('real Pi explicitly reacts, recalls, sends a saved sticker and uses QQ voice without forwarding ordinary output', async t => {
+  const f = await fixture(t);
+  const groupId = '444008';
+  const conversation = `group:${groupId}`;
+  LocalSocket.messages.set(-201, groupMessage(groupId, -201, 'A message to react to'));
+  LocalSocket.messages.set(-202, { ...groupMessage(groupId, -202, 'Our own earlier message'), user_id: 99999 });
+  LocalSocket.messages.set(-203, { ...groupMessage(groupId, -203, ''), message: [{ type: 'record', data: { file: 'fake-voice.silk' } }] });
+  LocalSocket.transcripts.set(-203, 'LOCAL_EXPLICIT_VOICE_TRANSCRIPT');
+  const host = await f.host('explicit-interactions', 'EXPLICIT_INTERACTION_RULES', [
+    fauxAssistantMessage(fauxToolCall('qq_react', { conversation, messageId: -201, emojiId: '66' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_react', { conversation, messageId: -201, emojiId: '66', set: false }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_recall', { conversation, messageId: -202 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'list', count: 4 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'send', conversation, emojiId: 'sticker-001', replyTo: -201 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'list', conversation }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send', conversation, text: 'A deliberate voice reply.', characterId: 'voice-001' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'transcribe', conversation, messageId: -203 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_send', { conversation, text: 'A deliberate quoted reply.', replyTo: -201 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('This ordinary assistant response must stay inside Pi.'),
+  ], undefined, [{ type: 'group', id: groupId }]);
+  await host.session.prompt('Use only explicit QQ tools for the selected interactions.');
+
+  const packets = host.socket.sent;
+  assert.deepEqual(packets.filter(packet => packet.action === 'set_msg_emoji_like').map(packet => packet.params), [
+    { message_id: -201, emoji_id: '66', set: true }, { message_id: -201, emoji_id: '66', set: false },
+  ]);
+  assert.deepEqual(packets.filter(packet => packet.action === 'delete_msg').map(packet => packet.params), [{ message_id: -202 }]);
+  assert.deepEqual(packets.filter(packet => packet.action === 'fetch_custom_face_detail').map(packet => packet.params), [{ count: 4 }]);
+  assert.deepEqual(packets.filter(packet => packet.action === 'send_custom_face').map(packet => packet.params), [
+    { emoji_id: 'sticker-001', group_id: Number(groupId), reply_to: -201 },
+  ]);
+  assert.deepEqual(packets.filter(packet => packet.action === 'get_ai_characters').map(packet => packet.params), [{ group_id: Number(groupId) }]);
+  assert.deepEqual(packets.filter(packet => packet.action === 'send_group_ai_record').map(packet => packet.params), [
+    { group_id: Number(groupId), character: 'voice-001', text: 'A deliberate voice reply.' },
+  ]);
+  assert.deepEqual(packets.filter(packet => packet.action === 'fetch_ptt_text').map(packet => packet.params), [{ message_id: -203 }]);
+  const recognition = packets.findIndex(packet => packet.action === 'fetch_ptt_text');
+  assert.equal(packets[recognition - 1]?.action, 'get_msg', 'recognition follows a scoped record-message lookup');
+  assert.equal(packets[recognition - 1]?.params.message_id, -203);
+  assert.deepEqual(packets.filter(packet => packet.action === 'get_msg').map(packet => packet.params.message_id), [-201, -201, -202, -203]);
+  const replies = packets.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action));
+  assert.equal(replies.length, 1);
+  assert.deepEqual(replies[0]!.params, { group_id: Number(groupId), message: [
+    { type: 'reply', data: { id: '-201' } }, { type: 'text', data: { text: 'A deliberate quoted reply.' } },
+  ] });
+  const results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.filter(result => result.role === 'toolResult' && result.isError).length, 0);
+  assert.match(JSON.stringify(results), /LOCAL_EXPLICIT_VOICE_TRANSCRIPT/);
+  assert.match(JSON.stringify(results), /Local test sticker/);
+  assert.match(JSON.stringify(results), /Local test voice/);
+  const records = await conversationRecords(host.cwd, { type: 'group', id: groupId });
+  assert.equal(records.length, 3, 'only successful sticker, voice and quoted sends become outgoing message records');
+  assert.ok(records.every(record => record.outgoing));
+  assert.equal(new Set(records.map(record => record.messageId)).size, 3);
+  assert.ok(records.some(record => record.segments.some((segment: { type: string }) => segment.type === 'custom_face')));
+  assert.ok(records.some(record => record.segments.some((segment: { type: string }) => segment.type === 'record')));
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('QQ interaction tools verify message ownership and reject unsupported private or temporary operations', async t => {
+  const f = await fixture(t);
+  const groupId = '444009';
+  const peerId = '444010';
+  const privateChat = `private:${peerId}`;
+  const conversation = `group:${groupId}`;
+  const temporary = `temporary:${groupId}:444011`;
+  LocalSocket.messages.set(-211, groupMessage(groupId, -211, 'Another member wrote this'));
+  LocalSocket.messages.set(-212, { ...groupMessage('555111', -212, 'A foreign conversation'), user_id: 99999 });
+  LocalSocket.messages.set(-213, { ...groupMessage('555111', -213, ''), message: [{ type: 'record', data: { file: 'foreign.silk' } }] });
+  const host = await f.host('interaction-boundaries', 'INTERACTION_BOUNDARIES', [
+    fauxAssistantMessage(fauxToolCall('qq_react', { conversation: privateChat, messageId: -211, emojiId: '66' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_react', { conversation, messageId: -212, emojiId: '66' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_recall', { conversation, messageId: -211 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_recall', { conversation, messageId: -212 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send', conversation: privateChat, text: 'Unsupported private AI voice.', characterId: 'voice-001' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'list', conversation: privateChat }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'transcribe', conversation, messageId: -211 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'transcribe', conversation, messageId: -213 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'send', conversation: temporary, emojiId: 'sticker-001' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_react', { conversation: 'group:555111', messageId: -212, emojiId: '66' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('All unsupported or incorrectly scoped operations were refused.'),
+  ], undefined, [{ type: 'group', id: groupId }, { type: 'private', id: peerId },
+    { type: 'temporary', sourceGroupId: groupId, id: '444011' }]);
+  await host.session.prompt('Check the interaction tool conversation and sender boundaries.');
+  const results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 10);
+  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  const forbidden = ['set_msg_emoji_like', 'delete_msg', 'send_custom_face', 'get_ai_characters', 'send_group_ai_record', 'fetch_ptt_text'];
+  assert.equal(host.socket.sent.filter(packet => forbidden.includes(packet.action)).length, 0);
+  assert.deepEqual(host.socket.sent.filter(packet => packet.action === 'get_msg').map(packet => packet.params.message_id),
+    [-212, -211, -212, -211, -213], 'unsupported contexts reject before read; scoped operations fetch their own supplied message');
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('paused Pi refuses all interaction, sticker and voice tool requests before dispatch', async t => {
+  const f = await fixture(t);
+  const groupId = '444012';
+  const conversation = `group:${groupId}`;
+  const host = await f.host('paused-interactions', 'PAUSED_INTERACTIONS', [
+    fauxAssistantMessage(fauxToolCall('qq_react', { conversation, messageId: -221, emojiId: '66' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_recall', { conversation, messageId: -221 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'list' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'send', conversation, emojiId: 'sticker-001' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'list', conversation }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'send', conversation, text: 'Paused voice.', characterId: 'voice-001' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_voice', { action: 'transcribe', conversation, messageId: -221 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('The paused channel refused all tool actions.'),
+  ], undefined, [{ type: 'group', id: groupId }]);
+  const pause = await requestRunAction(host.cwd, 'pause');
+  await eventually(async () => (await readRuntimeStatus(host.cwd))?.requestId === pause.requestId, 'interaction pause receipt');
+  await host.session.prompt('Try each interaction tool while paused.');
+  const operations = ['get_msg', 'set_msg_emoji_like', 'delete_msg', 'fetch_custom_face_detail', 'send_custom_face',
+    'get_ai_characters', 'send_group_ai_record', 'fetch_ptt_text'];
+  assert.equal(host.socket.sent.filter(packet => operations.includes(packet.action)).length, 0);
+  const results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 7);
+  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  assert.match(JSON.stringify(results), /PiQ 已暂停/);
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('an incoming voice stays in its journal without automatic recognition or transcript injection', async t => {
+  const f = await fixture(t);
+  const groupId = '444013';
+  const host = await f.host('voice-on-demand', 'VOICE_ON_DEMAND_RULES', [
+    fauxAssistantMessage('The voice can be read or transcribed when needed.'),
+  ], undefined, [{ type: 'group', id: groupId }]);
+  host.socket.receive({ ...groupMessage(groupId, -231, '[语音]'),
+    message: [{ type: 'record', data: { file: 'LOCAL_ON_DEMAND_VOICE.silk' } }] });
+  await eventually(() => host.faux.state.callCount === 1 && host.session.isIdle, 'the incoming voice signal');
+  assert.equal(host.socket.sent.filter(packet => ['get_msg', 'fetch_ptt_text', 'send_group_ai_record'].includes(packet.action)).length, 0);
+  const signals = host.session.messages.filter(message => message.role === 'custom' && message.customType === 'piq:messages');
+  assert.equal(signals.length, 1);
+  assert.doesNotMatch(JSON.stringify(signals), /LOCAL_ON_DEMAND_VOICE|\[语音\]/);
+  const records = await conversationRecords(host.cwd, { type: 'group', id: groupId });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.segments[0].type, 'record');
+  assert.equal(records[0]!.segments[0].data.file, 'LOCAL_ON_DEMAND_VOICE.silk');
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('real Pi registers group resources and stages only its workspace sticker for explicit account management', async t => {
+  const f = await fixture(t);
+  const groupId = '444014';
+  const conversation = `group:${groupId}`;
+  const localSticker = 'LOCAL_WORKSPACE_STICKER_BYTES';
+  const host = await f.host('explicit-resources', 'EXPLICIT_RESOURCE_RULES', [
+    fauxAssistantMessage(fauxToolCall('qq_group_files', { action: 'list', conversation }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_group_files', { action: 'mkdir', conversation, name: 'Pi resources' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_album', { action: 'list', conversation }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'rename', emojiId: 'sticker-001', name: 'Renamed local sticker' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'add', conversation, path: 'assets/local-sticker.png' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('The explicit resource operations are complete.'),
+  ], async cwd => { await writeFile(join(cwd, 'assets', 'local-sticker.png'), localSticker); }, [{ type: 'group', id: groupId }]);
+  for (const tool of ['qq_group_files', 'qq_album', 'qq_sticker']) assert.ok(host.session.getActiveToolNames().includes(tool));
+  await host.session.prompt('List this group file and album, create a folder, and manage the chosen local sticker.');
+  const resourceActions = ['get_group_root_files', 'create_group_file_folder', 'get_qun_album_list', 'modify_custom_face', 'download_file', 'add_custom_face'];
+  const packets = host.socket.sent.filter(packet => resourceActions.includes(packet.action));
+  assert.deepEqual(packets.map(packet => packet.action), resourceActions);
+  assert.deepEqual(packets[0]!.params, { group_id: Number(groupId) });
+  assert.deepEqual(packets[1]!.params, { group_id: Number(groupId), name: 'Pi resources', parent_id: '/' });
+  assert.deepEqual(packets[2]!.params, { group_id: Number(groupId), attach_info: '' });
+  assert.deepEqual(packets[3]!.params, { emoji_id: 'sticker-001', desc: 'Renamed local sticker' });
+  assert.equal(packets[4]!.params.base64, Buffer.from(localSticker).toString('base64'));
+  assert.match(String(packets[4]!.params.name), /^piq-[0-9a-f-]+\.png$/);
+  assert.equal('url' in packets[4]!.params, false);
+  assert.deepEqual(packets[5]!.params, { file: '/backend/temporary-sticker.png' });
+  assert.ok(packets.every(packet => packet.params.group_id === undefined || packet.params.group_id === Number(groupId)));
+  const results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 5);
+  assert.ok(results.every(result => result.role === 'toolResult' && !result.isError));
+  for (const marker of ['Local group file.txt', 'Local group album', 'added-sticker-001']) assert.match(JSON.stringify(results), new RegExp(marker.replaceAll('.', '\\.')));
+  assert.equal(host.socket.sent.filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0);
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('group resource tools refuse foreign scope and sibling assets, and all resource tools honor pause', async t => {
+  const f = await fixture(t);
+  const groupId = '444015';
+  const conversation = `group:${groupId}`;
+  const privateChat = 'private:444016';
+  const outside = await initializeGroup(f.root, 'other-resources', { name: 'Other resource group', conversations: [] });
+  await writeFile(join(outside, 'assets', 'private-sticker.png'), 'OTHER_GROUP_PRIVATE_ASSET_BYTES');
+  const host = await f.host('resource-boundaries', 'RESOURCE_BOUNDARY_RULES', [
+    fauxAssistantMessage(fauxToolCall('qq_group_files', { action: 'list', conversation: 'group:555111' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_group_files', { action: 'list', conversation: privateChat }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_album', { action: 'list', conversation: privateChat }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'add', path: '../other-resources/assets/private-sticker.png' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('Invalid resource scopes were refused.'),
+    fauxAssistantMessage(fauxToolCall('qq_group_files', { action: 'mkdir', conversation, name: 'Paused folder' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_album', { action: 'list', conversation }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'rename', emojiId: 'sticker-001', name: 'Paused rename' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_sticker', { action: 'add', path: 'assets/local-sticker.png' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('Paused resource operations were refused.'),
+  ], async cwd => { await writeFile(join(cwd, 'assets', 'local-sticker.png'), 'LOCAL_PAUSED_RESOURCE_BYTES'); },
+  [{ type: 'group', id: groupId }, { type: 'private', id: '444016' }]);
+  await host.session.prompt('Check group resource scope and local asset boundaries.');
+  let results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 4);
+  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  const pause = await requestRunAction(host.cwd, 'pause');
+  await eventually(async () => (await readRuntimeStatus(host.cwd))?.requestId === pause.requestId, 'resource pause receipt');
+  await host.session.prompt('Try all resource tools while the channel is paused.');
+  results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 8);
+  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  assert.match(JSON.stringify(results.slice(4)), /PiQ 已暂停/);
+  const resourceActions = ['get_group_root_files', 'create_group_file_folder', 'get_qun_album_list', 'modify_custom_face', 'download_file', 'add_custom_face'];
+  assert.equal(host.socket.sent.filter(packet => resourceActions.includes(packet.action)).length, 0);
+  assert.doesNotMatch(JSON.stringify(host.socket.sent), /OTHER_GROUP_PRIVATE_ASSET_BYTES|LOCAL_PAUSED_RESOURCE_BYTES/);
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
 });

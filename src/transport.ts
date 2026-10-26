@@ -1,6 +1,9 @@
 import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { OneBotApiError, OneBotClient } from './onebot-client.ts';
 import { conversationKey, validateConversation, type Conversation } from './conversations.ts';
+import { listVoiceCharacters, sendAiVoice, transcribeVoice, type VoiceCategory } from './voice.ts';
+import type { ResourceRequest } from './resource-tools.ts';
 
 export interface ConversationEvent {
   conversation: Conversation;
@@ -12,6 +15,21 @@ export interface ConversationEvent {
   sender: string;
   segments: Array<{ type: string; data: Record<string, unknown> }>;
   rawText: string;
+  outgoing: boolean;
+}
+
+export interface PokeEvent {
+  kind: 'poke';
+  eventId: string;
+  source: 'notice' | 'action';
+  conversation: Conversation;
+  selfId: string;
+  userId: string;
+  targetId: string;
+  time: number;
+  sender: string;
+  rawText: string;
+  segments: Array<{ type: string; data: Record<string, unknown> }>;
   outgoing: boolean;
 }
 
@@ -38,6 +56,7 @@ export interface TransportOptions {
   /** Maximum time to wait for the socket before dispatching a new message. */
   connectionTimeoutMs?: number;
   onMessage: (event: ConversationEvent) => void;
+  onPoke?: (event: PokeEvent) => void;
   onStatus: (status: 'connected' | 'disconnected' | 'error', error?: unknown) => void;
 }
 
@@ -57,6 +76,49 @@ function id(value: unknown, signed = false): string | undefined {
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function messageId(value: number): number {
+  if (!id(value, true) || value < -2_147_483_648 || value > 2_147_483_647) {
+    throw new Error('Message ID must be a non-zero signed 32-bit integer.');
+  }
+  return value;
+}
+
+function emojiId(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error('Emoji ID must be a non-empty string without control characters.');
+  }
+  return value;
+}
+
+export function normalizePokeEvent(event: Record<string, unknown>): PokeEvent | undefined {
+  if (event.post_type !== 'notice' || event.notice_type !== 'notify' || event.sub_type !== 'poke') return;
+  const selfId = id(event.self_id);
+  const targetId = id(event.target_id);
+  const reportedUser = id(event.user_id);
+  if (!selfId || !reportedUser || !targetId || typeof event.time !== 'number' || !Number.isFinite(event.time) || event.time < 0) return;
+  const groupId = id(event.group_id);
+  if (!groupId && event.group_id !== undefined && event.group_id !== 0 && event.group_id !== '0') return;
+  let conversation: Conversation;
+  let userId: string;
+  if (groupId) {
+    conversation = { type: 'group', id: groupId };
+    userId = reportedUser;
+  } else {
+    // SnowLuma's private notice uses user_id for the peer, sender_id for the actor.
+    if (reportedUser === selfId) return;
+    const actor = event.sender_id === undefined ? (targetId === selfId ? reportedUser : undefined) : id(event.sender_id);
+    if (!actor || ![selfId, reportedUser].includes(actor) || ![selfId, reportedUser].includes(targetId)) return;
+    conversation = { type: 'private', id: reportedUser };
+    userId = actor;
+  }
+  const sender = object(event.sender) ? event.sender.card || event.sender.nickname : undefined;
+  return {
+    kind: 'poke', eventId: randomUUID(), source: 'notice', conversation, selfId, userId, targetId,
+    time: event.time, sender: typeof sender === 'string' ? sender : userId,
+    rawText: `${userId} 戳了戳 ${targetId}`, segments: [], outgoing: userId === selfId,
+  };
 }
 
 export function normalizeMessageEvent(event: Record<string, unknown>): ConversationEvent | undefined {
@@ -102,6 +164,7 @@ export class SnowLumaTransport {
   private readonly endpoint: string;
   private closed = false;
   private selfId?: string;
+  private connectionVersion = 0;
 
   constructor(options: TransportOptions, client?: OneBotClient) {
     this.connectionTimeoutMs = options.connectionTimeoutMs ?? 5_000;
@@ -120,10 +183,12 @@ export class SnowLumaTransport {
     const receive = (event: Record<string, unknown>) => {
       const normalized = normalizeMessageEvent(event);
       if (normalized) { this.selfId = normalized.selfId; options.onMessage(normalized); }
+      const poke = normalizePokeEvent(event);
+      if (poke) { this.selfId = poke.selfId; options.onPoke?.(poke); }
     };
     this.unsubscribe = [
-      this.client.on('open', () => { this.selfId = undefined; options.onStatus('connected'); }),
-      this.client.on('close', () => options.onStatus('disconnected')),
+      this.client.on('open', () => { this.connectionVersion++; this.selfId = undefined; options.onStatus('connected'); }),
+      this.client.on('close', () => { this.connectionVersion++; this.selfId = undefined; options.onStatus('disconnected'); }),
       this.client.on('error', error => options.onStatus('error', error)),
       this.client.on('message', receive),
     ];
@@ -176,6 +241,198 @@ export class SnowLumaTransport {
     this.client.close();
   }
 
+  private requestSignal(signal?: AbortSignal): AbortSignal {
+    const combined = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
+    combined.throwIfAborted();
+    return combined;
+  }
+
+  private async getSelfId(signal: AbortSignal): Promise<string> {
+    if (this.selfId) return this.selfId;
+    const version = this.connectionVersion;
+    const result = await this.client.raw('get_login_info', {}, { signal });
+    const account = object(result) ? id(result.user_id) : undefined;
+    if (!account) throw new Error('SnowLuma returned an invalid login account.');
+    signal.throwIfAborted();
+    if (version !== this.connectionVersion || !this.isConnected) throw new Error('SnowLuma connection changed while reading the login account.');
+    this.selfId = account;
+    return account;
+  }
+
+  /** Resource tools retain their explicit scope; the connection owns cancellation and receipts. */
+  async resources<T>(operation: (request: ResourceRequest) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const requestSignal = this.requestSignal(signal);
+    await this.waitForConnection(requestSignal);
+    const version = this.connectionVersion;
+    const request: ResourceRequest = async (action, params, mutating = false) => {
+      requestSignal.throwIfAborted();
+      this.assertConnection(version);
+      if (mutating) return this.mutate(action, params, requestSignal, version);
+      const result = await this.client.raw<unknown>(action, params, { signal: requestSignal });
+      this.assertConnection(version);
+      return result;
+    };
+    return operation(request);
+  }
+
+  private assertConnection(version: number): void {
+    if (version !== this.connectionVersion || !this.isConnected) throw new Error('核验消息后连接已变化，请重新确认消息归属。');
+  }
+
+  private async mutate<T = unknown>(action: string, params: Record<string, unknown>, signal: AbortSignal, version?: number): Promise<T> {
+    await this.waitForConnection(signal);
+    signal.throwIfAborted();
+    if (version !== undefined) this.assertConnection(version);
+    try {
+      return await this.client.raw<T>(action, params, {
+        signal: AbortSignal.any([signal, AbortSignal.timeout(30_000 + this.connectionTimeoutMs)]),
+      });
+    } catch (cause) {
+      if (cause instanceof OneBotApiError) throw cause;
+      throw new Error(`Action ${action} result is unknown. Check the conversation before deciding to retry.`, { cause });
+    }
+  }
+
+  /** Fetch a message only when its routing fields prove the explicitly selected conversation. */
+  private async scopedMessage(conversation: Conversation, value: number, signal: AbortSignal): Promise<{ record: Record<string, unknown>; selfId: string; senderId: string; version: number }> {
+    await this.waitForConnection(signal);
+    const version = this.connectionVersion;
+    const selfId = await this.getSelfId(signal);
+    const result = await this.client.raw('get_msg', { message_id: value }, { signal });
+    if (!object(result) || id(result.message_id, true) !== String(value)) throw new Error('无法确认消息归属：get_msg 返回的消息 ID 无效。');
+    const sender = object(result.sender) ? result.sender : {};
+    const senderId = id(result.user_id) ?? id(sender.user_id);
+    if (!senderId || (result.user_id !== undefined && !id(result.user_id)) || (sender.user_id !== undefined && !id(sender.user_id))
+      || (id(result.user_id) && id(sender.user_id) && id(result.user_id) !== id(sender.user_id))
+      || (result.self_id !== undefined && id(result.self_id) !== selfId)) {
+      throw new Error('无法确认消息归属：发件者或账号信息无效。');
+    }
+    let belongs = false;
+    if (conversation.type === 'group') {
+      belongs = result.message_type === 'group' && id(result.group_id) === conversation.id;
+    } else if (result.message_type === 'private') {
+      const sourceGroup = id(sender.group_id) ?? id(result.group_id);
+      const temporary = result.sub_type === 'group';
+      const peer = senderId === selfId ? id(result.target_id) ?? id(result.session_id) : senderId;
+      const target = id(result.target_id);
+      const contradictorySource = id(sender.group_id) && id(result.group_id) && id(sender.group_id) !== id(result.group_id);
+      const contradictoryPeer = id(result.target_id) && id(result.session_id) && senderId === selfId && id(result.target_id) !== id(result.session_id);
+      const endpointsMatch = peer === conversation.id && !contradictorySource && !contradictoryPeer
+        && (result.target_id === undefined || (target !== undefined && target === (senderId === selfId ? peer : selfId)));
+      belongs = endpointsMatch && (conversation.type === 'temporary'
+        ? temporary && sourceGroup === conversation.sourceGroupId
+        : !temporary && !sourceGroup);
+    }
+    if (!belongs) throw new Error('无法确认消息属于指定对话，已拒绝操作。');
+    signal.throwIfAborted();
+    this.assertConnection(version);
+    return { record: result, selfId, senderId, version };
+  }
+
+  async poke(conversationInput: Conversation, userId?: string, signal?: AbortSignal): Promise<{ selfId: string; userId: string }> {
+    const conversation = validateConversation(conversationInput);
+    if (conversation.type === 'temporary') throw new Error('临时会话不支持戳一戳。');
+    const target = userId === undefined && conversation.type === 'private' ? conversation.id : id(userId);
+    if (!target || (conversation.type === 'private' && target !== conversation.id)) throw new Error('群聊必须指定有效目标；私聊只能戳当前对话的对方。');
+    const requestSignal = this.requestSignal(signal);
+    await this.waitForConnection(requestSignal);
+    const selfId = await this.getSelfId(requestSignal);
+    const version = this.connectionVersion;
+    await this.mutate(conversation.type === 'group' ? 'group_poke' : 'friend_poke',
+      conversation.type === 'group' ? { group_id: Number(conversation.id), user_id: Number(target) } : { user_id: Number(target) }, requestSignal, version);
+    return { selfId, userId: target };
+  }
+
+  async react(conversationInput: Conversation, value: number, reaction: string, set = true, signal?: AbortSignal): Promise<void> {
+    const conversation = validateConversation(conversationInput);
+    messageId(value); emojiId(reaction);
+    if (typeof set !== 'boolean') throw new Error('Reaction set must be a boolean.');
+    if (conversation.type !== 'group') throw new Error('SnowLuma 仅支持为群聊消息添加表情回应。');
+    const requestSignal = this.requestSignal(signal);
+    const message = await this.scopedMessage(conversation, value, requestSignal);
+    await this.mutate('set_msg_emoji_like', { message_id: value, emoji_id: reaction, set }, requestSignal, message.version);
+  }
+
+  async recall(conversationInput: Conversation, value: number, signal?: AbortSignal): Promise<void> {
+    const conversation = validateConversation(conversationInput);
+    messageId(value);
+    const requestSignal = this.requestSignal(signal);
+    const message = await this.scopedMessage(conversation, value, requestSignal);
+    if (message.senderId !== message.selfId) throw new Error('只能撤回当前 QQ 账号发送的消息。');
+    await this.mutate('delete_msg', { message_id: value }, requestSignal, message.version);
+  }
+
+  async listStickers(count = 48, signal?: AbortSignal): Promise<Array<{ emojiId: string; md5?: string; description?: string; url?: string }>> {
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error('Sticker count must be a non-negative safe integer.');
+    const requestSignal = this.requestSignal(signal);
+    await this.waitForConnection(requestSignal);
+    const result = await this.client.raw<unknown>('fetch_custom_face_detail', { count }, { signal: requestSignal });
+    if (!Array.isArray(result)) throw new Error('SnowLuma returned an invalid sticker list.');
+    return result.map(item => {
+      if (!object(item)) throw new Error('SnowLuma returned an invalid sticker entry.');
+      const identity = typeof item.emoji_id === 'number' && Number.isSafeInteger(item.emoji_id) ? String(item.emoji_id) : item.emoji_id;
+      return { emojiId: emojiId(identity),
+        ...(typeof item.md5 === 'string' ? { md5: item.md5 } : {}),
+        ...(typeof item.desc === 'string' ? { description: item.desc } : {}),
+        ...(typeof item.url === 'string' ? { url: item.url } : {}),
+      };
+    });
+  }
+
+  async sendSticker(conversationInput: Conversation, sticker: string, replyTo?: number, signal?: AbortSignal): Promise<{ messageId: string }> {
+    const conversation = validateConversation(conversationInput);
+    emojiId(sticker);
+    if (replyTo !== undefined) messageId(replyTo);
+    if (conversation.type === 'temporary') throw new Error('临时会话不支持发送收藏表情。');
+    const requestSignal = this.requestSignal(signal);
+    const result = await this.mutate<Record<string, unknown> | null>('send_custom_face', {
+      emoji_id: sticker,
+      ...(conversation.type === 'group' ? { group_id: Number(conversation.id) } : { user_id: Number(conversation.id) }),
+      ...(replyTo === undefined ? {} : { reply_to: replyTo }),
+    }, requestSignal);
+    const receiptId = id(result?.message_id, true);
+    if (!receiptId || Number(receiptId) < -2_147_483_648 || Number(receiptId) > 2_147_483_647) {
+      throw new Error('Sticker send result is unknown: SnowLuma returned an invalid message receipt.');
+    }
+    return { messageId: receiptId };
+  }
+
+  async getVoices(conversationInput: Conversation, signal?: AbortSignal): Promise<VoiceCategory[]> {
+    const conversation = validateConversation(conversationInput);
+    if (conversation.type !== 'group') throw new Error('QQ AI 语音仅支持群聊。');
+    const requestSignal = this.requestSignal(signal);
+    await this.waitForConnection(requestSignal);
+    return listVoiceCharacters(this.client, conversation.id, requestSignal);
+  }
+
+  async speak(conversationInput: Conversation, text: string, characterId: string, signal?: AbortSignal): Promise<{ messageId: string }> {
+    const conversation = validateConversation(conversationInput);
+    if (conversation.type !== 'group') throw new Error('QQ AI 语音仅支持群聊。');
+    if (!text?.trim() || !characterId?.trim()) throw new Error('AI 语音需要非空文字和语音角色。');
+    const requestSignal = this.requestSignal(signal);
+    await this.waitForConnection(requestSignal);
+    requestSignal.throwIfAborted();
+    try {
+      return await sendAiVoice(this.client, conversation.id, text, characterId,
+        AbortSignal.any([requestSignal, AbortSignal.timeout(30_000 + this.connectionTimeoutMs)]));
+    } catch (cause) {
+      if (cause instanceof OneBotApiError) throw cause;
+      throw new Error('AI voice send result is unknown. Check the conversation before deciding to retry.', { cause });
+    }
+  }
+
+  async transcribe(conversationInput: Conversation, value: number, signal?: AbortSignal): Promise<{ text: string }> {
+    const conversation = validateConversation(conversationInput);
+    messageId(value);
+    const requestSignal = this.requestSignal(signal);
+    const { record, version } = await this.scopedMessage(conversation, value, requestSignal);
+    if (!Array.isArray(record.message) || !record.message.some(segment => object(segment) && segment.type === 'record' && object(segment.data))) {
+      throw new Error('指定消息不包含 QQ 语音。');
+    }
+    this.assertConnection(version);
+    return transcribeVoice(this.client, value, requestSignal);
+  }
+
   /** The anchor is inclusive. No anchor requests the most recent available records. */
   async fetchHistory(conversationInput: Conversation, cursor: HistoryCursor | null, count: number, signal?: AbortSignal): Promise<ConversationEvent[]> {
     const conversation = validateConversation(conversationInput);
@@ -184,10 +441,7 @@ export class SnowLumaTransport {
     if (this.closed || !this.client.isConnected) throw new Error('SnowLuma is disconnected; history is unavailable.');
     const requestSignal = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
     requestSignal.throwIfAborted();
-    if (!this.selfId) {
-      this.selfId = id((await this.client.raw('get_login_info', {}, { signal: requestSignal })).user_id);
-      if (!this.selfId) throw new Error('SnowLuma returned an invalid login account.');
-    }
+    await this.getSelfId(requestSignal);
     requestSignal.throwIfAborted();
     const paging = { count, ...(cursor ? { message_id: Number(cursor.messageId), reverse_order: false } : {}) };
     // History paging is a backend extension to the OneBot 11 action envelope.

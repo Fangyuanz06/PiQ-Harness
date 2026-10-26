@@ -13,7 +13,7 @@ import { readModelStatus, requestModelChange } from './model-control.ts';
 import { readRuntimeStatus, requestRunAction } from './run-control.ts';
 import { getProcessStatus, handoffToTerminal, startGroup } from './process-manager.ts';
 import { ensureSnowLuma, openSnowLumaManual, type SnowLumaServiceResult } from './snowluma-service.ts';
-import { parseStoredMessage } from './store.ts';
+import { parseStoredRecord } from './store.ts';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const DOCS = new Set(['AGENTS.md', 'PERSONA.md', 'MEMORY.md']);
@@ -290,7 +290,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
           catch { throw new HttpError(400, 'JSONL 日志含无效的 UTF-8 内容，请检查该文件。'); }
           if (content) {
             for (const line of content.slice(0, -1).split(/\r?\n/)) {
-              const record = parseStoredMessage(line, parts[5]);
+              const record = parseStoredRecord(line, parts[5]);
               if (conversationKey(record.conversation) !== conversationKey(conversation)) throw new HttpError(400, '日志路径与消息来源对话不一致。');
             }
           }
