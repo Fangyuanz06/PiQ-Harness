@@ -90,7 +90,9 @@ export async function resolvePiCommand(env: NodeJS.ProcessEnv = process.env): Pr
 }
 
 export interface OpenGroupOptions {
+  /** The spawned command can be a launcher; this PID is not necessarily the Pi owner. */
   onSpawn?: (pid: number) => void | Promise<void>;
+  env?: NodeJS.ProcessEnv;
 }
 
 export async function openGroup(cwd: string, extraArgs: string[] = [], options: OpenGroupOptions = {}): Promise<number> {
@@ -98,11 +100,12 @@ export async function openGroup(cwd: string, extraArgs: string[] = [], options: 
   if (!config) throw new Error("该对话组尚未初始化。请先运行 init <对话组标识> --name <名称>。");
   if (!config.conversations.length) throw new Error('请先向对话组添加至少一个对话。');
   await assertAssignments(cwd, config);
-  const launcher = await resolvePiCommand();
+  const env = { ...process.env, ...options.env };
+  const launcher = await resolvePiCommand(env);
   const selectedModel = await modelArguments(cwd);
   return await new Promise<number>((resolveCode, reject) => {
     const child = spawn(launcher.command, [...launcher.args, "--continue", "--session-dir", join(cwd, ".pi", "sessions"), ...selectedModel, ...extraArgs], {
-      cwd, stdio: "inherit", env: process.env, shell: false, windowsHide: true,
+      cwd, stdio: "inherit", env, shell: false, windowsHide: true,
     });
     let registration: Promise<void> = Promise.resolve();
     child.once('spawn', () => {

@@ -203,7 +203,7 @@ test('an owner appearing after lease preparation prevents the terminal window', 
   assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'owner.lock'), 'utf8')).token, 'new-owner');
 });
 
-test('managed terminal entries register wrapper and Pi child while plain entries do not', async () => {
+test('managed terminal entries register only the wrapper and pass its identity through the environment', async () => {
   const cwd = join(process.cwd(), '.test-tmp', 'entry-fixture');
   const calls: unknown[] = [];
   const result = await terminalMain([cwd], {
@@ -211,12 +211,14 @@ test('managed terminal entries register wrapper and Pi child while plain entries
     register: async (...args: [string, string, number?, number?]) => { calls.push(args); },
     open: async (path, args, options) => {
       assert.equal(path, cwd); assert.deepEqual(args, []);
-      await options!.onSpawn!(123456);
+      assert.equal(options!.onSpawn, undefined);
+      assert.equal(options!.env!.PIQ_TERMINAL_WRAPPER_PID, String(process.pid));
+      assert.equal(options!.env!.PIQ_TERMINAL_RETURN_TOKEN, 'managed-entry-token');
       return 0;
     },
   });
   assert.equal(result, 0);
-  assert.deepEqual(calls, [[cwd, 'managed-entry-token', process.pid], [cwd, 'managed-entry-token', process.pid, 123456]]);
+  assert.deepEqual(calls, [[cwd, 'managed-entry-token', process.pid]]);
   assert.equal(await terminalMain([cwd], { env: {}, register: async () => assert.fail('Plain CLI must not register a monitor'), open: async (_cwd, _args, options) => {
     assert.equal(options, undefined); return 0;
   } }), 0);
@@ -225,6 +227,29 @@ test('managed terminal entries register wrapper and Pi child while plain entries
     register: async () => { throw new Error('fixture stale terminal token'); },
     open: async () => assert.fail('An invalid wrapper registration must not launch Pi'),
   }), /fixture stale terminal token/);
+});
+
+test('nested launchers inherit the terminal wrapper identity without being registered as Pi owners', async t => {
+  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const launcher = join(f.root, 'nested-launcher.cjs');
+  const actualPi = join(f.root, 'actual-pi.cjs');
+  const report = join(f.root, 'actual-pi.json');
+  await writeFile(launcher, `const {spawn}=require('node:child_process'); const child=spawn(process.execPath,[process.env.FIXTURE_REAL_PI_ENTRY],{stdio:'inherit',env:process.env,shell:false}); child.once('exit',code=>{process.exitCode=code??1});`);
+  await writeFile(actualPi, `require('node:fs').writeFileSync(process.env.FIXTURE_REAL_PI_REPORT,JSON.stringify({pid:process.pid,parentPid:process.ppid,wrapper:process.env.PIQ_TERMINAL_WRAPPER_PID,token:process.env.PIQ_TERMINAL_RETURN_TOKEN,args:process.argv.slice(2)}));`);
+  const calls: unknown[] = [];
+  const originalWrapper = process.env.PIQ_TERMINAL_WRAPPER_PID;
+  assert.equal(await terminalMain([f.cwd], {
+    env: { PIQ_PI_ENTRY: launcher, PIQ_TERMINAL_RETURN_TOKEN: 'nested-return-token', FIXTURE_REAL_PI_ENTRY: actualPi, FIXTURE_REAL_PI_REPORT: report },
+    register: async (...args: [string, string, number?, number?]) => { calls.push(args); },
+  }), 0);
+  const actual = JSON.parse(await readFile(report, 'utf8'));
+  assert.deepEqual(calls, [[f.cwd, 'nested-return-token', process.pid]]);
+  assert.notEqual(actual.pid, process.pid);
+  assert.notEqual(actual.parentPid, process.pid);
+  assert.equal(actual.wrapper, String(process.pid));
+  assert.equal(actual.token, 'nested-return-token');
+  assert.deepEqual(actual.args, []);
+  assert.equal(process.env.PIQ_TERMINAL_WRAPPER_PID, originalWrapper, 'Child configuration must not modify the caller environment.');
 });
 
 test('Pi spawn registration finishes before an exiting child resolves and failures terminate the child', async t => {

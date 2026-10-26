@@ -275,6 +275,8 @@ export async function runTerminalMonitor(cwd: string, options: TerminalMonitorOp
     return true;
   });
   if (!ready) return;
+  let unregisteredOwnerSince: number | undefined;
+  const ownerRegistrationGrace = Math.min(registrationTimeout, 3_000);
   try {
     while (true) {
       const lease = await withLeaseLock(directory, () => leaseAt(directory));
@@ -288,9 +290,16 @@ export async function runTerminalMonitor(cwd: string, options: TerminalMonitorOp
       const differentPi = owner && lease.piPid !== undefined && owner.pid !== lease.piPid;
       const unknownOwner = owner && lease.piPid === undefined && !wrapperAlive;
       const replacedAfterExit = owner && lease.ownerToken !== undefined && lease.ownerToken !== owner.token && !wrapperAlive;
-      if (differentPi || unknownOwner || replacedAfterExit) {
+      if (differentPi || replacedAfterExit) {
         await cancelTerminalReturn(root, token); return;
       }
+      if (unknownOwner) {
+        // The console can disappear between Pi acquiring its owner and registering its real PID.
+        unregisteredOwnerSince ??= Date.now();
+        if (Date.now() - unregisteredOwnerSince >= ownerRegistrationGrace) { await cancelTerminalReturn(root, token); return; }
+        await delay(interval); continue;
+      }
+      unregisteredOwnerSince = undefined;
       if (owner && lease.piPid === owner.pid && lease.ownerToken !== owner.token) {
         await withLeaseLock(directory, async () => { const current = await leaseAt(directory); if (current?.token === token) await write(join(directory, LEASE), { ...current, ownerToken: owner.token }); });
       }

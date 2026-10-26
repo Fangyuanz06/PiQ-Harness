@@ -18,7 +18,9 @@ export async function terminalMain(args = process.argv.slice(2), options: Termin
   const register = options.register ?? registerTerminal;
   await register(cwd, token, process.pid);
   return await (options.open ?? openGroup)(cwd, [], {
-    onSpawn: pid => register(cwd, token, process.pid, pid),
+    // A managed Pi command may itself launch the real Pi process. Its extension
+    // registers the actual owner; every launcher inherits only the wrapper identity.
+    env: { ...(options.env ?? process.env), PIQ_TERMINAL_RETURN_TOKEN: token, PIQ_TERMINAL_WRAPPER_PID: String(process.pid) },
   });
 }
 

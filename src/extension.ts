@@ -17,6 +17,7 @@ import { registerGroupFileTool } from './group-files.ts';
 import { registerAlbumTool } from './albums.ts';
 import { manageSticker } from './sticker-management.ts';
 import { workspaceFile } from './workspace-files.ts';
+import { registerTerminal } from './terminal-monitor.ts';
 
 const SIGNAL = 'piq:messages';
 
@@ -182,6 +183,12 @@ export default function piq(pi: ExtensionAPI): void {
       if (startGeneration !== generation) { await store.close(); return; }
       releaseConversations = await claimConversations(ctx.cwd, config);
       if (startGeneration !== generation) { await releaseConversations(); await store.close(); return; }
+      const terminalToken = process.env.PIQ_TERMINAL_RETURN_TOKEN;
+      const wrapperPid = Number(process.env.PIQ_TERMINAL_WRAPPER_PID);
+      if (terminalToken && Number.isSafeInteger(wrapperPid) && wrapperPid > 0 && process.env.PIQ_RUN_MODE !== 'background') {
+        await registerTerminal(ctx.cwd, terminalToken, wrapperPid, process.pid);
+        if (startGeneration !== generation) { await releaseConversations(); await store.close(); return; }
+      }
       const current = {
         id: randomUUID(), cwd: ctx.cwd, ctx, config, store,
         releaseConversations, histories: new Map<string, HistorySync>(),

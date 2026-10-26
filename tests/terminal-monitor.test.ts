@@ -97,6 +97,36 @@ test('recovery waits for both the terminal wrapper and its Pi process to exit', 
   assert.equal(f.starts(), 1);
 });
 
+test('closing before real Pi PID registration waits for owner cleanup then recovers once', async t => {
+  const f = await fixture(t);
+  const prepared = await f.prepare();
+  const wrapper = await f.child(); const pi = await f.child();
+  await registerTerminal(f.cwd, prepared.token, wrapper.pid);
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: pi.pid, token: 'registering-owner' }));
+  await stopChild(wrapper);
+  await delay(60);
+  assert.equal(f.starts(), 0);
+  assert.equal((await f.state()).state, 'watching');
+  await stopChild(pi);
+  await Promise.all(f.tasks);
+  assert.equal(f.starts(), 1);
+  assert.equal(await f.state(), null);
+});
+
+test('a still-unregistered live owner outlasting the short grace makes the monitor yield', async t => {
+  const f = await fixture(t);
+  const prepared = await f.prepare({ registrationTimeoutMs: 1_000 });
+  const wrapper = await f.child(); const unrelatedPi = await f.child();
+  await registerTerminal(f.cwd, prepared.token, wrapper.pid);
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: unrelatedPi.pid, token: 'unregistered-owner' }));
+  await stopChild(wrapper);
+  await Promise.all(f.tasks);
+  assert.equal(f.starts(), 0);
+  assert.equal(await f.state(), null);
+  assert.equal(unrelatedPi.exitCode, null);
+  assert.equal(unrelatedPi.signalCode, null);
+});
+
 test('explicit cancellation suppresses recovery and stale tokens cannot affect a replacement', async t => {
   const f = await fixture(t);
   const first = await f.prepare();

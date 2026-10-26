@@ -11,6 +11,7 @@ import { initializeGroup } from '../src/config.ts';
 import { GroupStore } from '../src/store.ts';
 import { normalizeMessageEvent } from '../src/transport.ts';
 import { readRuntimeStatus, requestRunAction } from '../src/run-control.ts';
+import { cancelTerminalReturn, prepareTerminalReturn, runTerminalMonitor } from '../src/terminal-monitor.ts';
 
 function message(id: number, text = 'The same text is allowed twice') {
   return { post_type: 'message', message_type: 'group', self_id: 99999, group_id: 123455,
@@ -49,7 +50,7 @@ async function eventually(check: () => boolean | Promise<boolean>, label: string
   }
 }
 
-async function fixture(t: TestContext, responses: FauxResponseStep[], options: { offline?: boolean; pending?: boolean } = {}) {
+async function fixture(t: TestContext, responses: FauxResponseStep[], options: { offline?: boolean; pending?: boolean; managedTerminal?: boolean; background?: boolean } = {}) {
   const oldAutostart = process.env.PIQ_SNOWLUMA_AUTOSTART;
   process.env.PIQ_SNOWLUMA_AUTOSTART = '0';
   t.after(() => { if (oldAutostart === undefined) delete process.env.PIQ_SNOWLUMA_AUTOSTART; else process.env.PIQ_SNOWLUMA_AUTOSTART = oldAutostart; });
@@ -60,6 +61,31 @@ async function fixture(t: TestContext, responses: FauxResponseStep[], options: {
   const cwd = await initializeGroup(root, cfg.id, cfg);
   await writeFile(join(cwd, 'PIQ.md'), '# Test\n```json\n' + JSON.stringify({ ...cfg,
     wsUrl: 'ws://127.0.0.1:9/', accessTokenEnv: 'PIQ_TEST_UNUSED_TOKEN', quietMs: 40, maxWaitMs: 100, minIntervalMs: 0 }) + '\n```\n');
+  const terminalEnvironment = ['PIQ_TERMINAL_RETURN_TOKEN', 'PIQ_TERMINAL_WRAPPER_PID', 'PIQ_RUN_MODE'] as const;
+  const savedEnvironment = Object.fromEntries(terminalEnvironment.map(key => [key, process.env[key]]));
+  for (const key of terminalEnvironment) delete process.env[key];
+  const monitorTasks: Promise<void>[] = [];
+  if (options.managedTerminal) {
+    const prepared = await prepareTerminalReturn(cwd, {
+      readyTimeoutMs: 2_000,
+      launch: async specification => {
+        monitorTasks.push(runTerminalMonitor(cwd, { token: specification.env.PIQ_TERMINAL_RETURN_TOKEN,
+          pollMs: 5, registrationTimeoutMs: 5_000, start: async () => { assert.fail('A live test session must not recover.'); } }));
+        return { pid: process.pid };
+      },
+    });
+    process.env.PIQ_TERMINAL_RETURN_TOKEN = prepared.token;
+    process.env.PIQ_TERMINAL_WRAPPER_PID = String(process.ppid);
+  }
+  if (options.background) process.env.PIQ_RUN_MODE = 'background';
+  t.after(async () => {
+    if (monitorTasks.length) await cancelTerminalReturn(cwd);
+    await Promise.all(monitorTasks);
+    for (const key of terminalEnvironment) {
+      const value = savedEnvironment[key];
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
   if (options.pending) {
     LocalSocket.history = [message(1, 'Previously collected message')];
     const store = await GroupStore.open(cwd, cfg);
@@ -213,5 +239,29 @@ test('reopening an idle Pi session keeps its history without starting a new mode
   assert.equal(replacement.sessionManager.getSessionId(), sessionId);
   assert.equal(f.faux.state.callCount, 1);
   assert.equal(replacement.messages.filter(item => item.role === 'custom' && item.customType === 'piq:resume').length, 0);
+  assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
+});
+
+test('the actual Pi session registers its own process beyond a terminal launcher and can reload', async t => {
+  const f = await fixture(t, [], { managedTerminal: true });
+  const leasePath = join(f.cwd, '.piq', 'terminal-return.json');
+  const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+  assert.equal(lease.wrapperPid, process.ppid);
+  assert.equal(lease.piPid, process.pid);
+  assert.notEqual(lease.wrapperPid, lease.piPid);
+  await f.session.reload();
+  const reloaded = JSON.parse(await readFile(leasePath, 'utf8'));
+  assert.equal(reloaded.piPid, process.pid);
+  assert.equal(reloaded.wrapperPid, process.ppid);
+  assert.equal(reloaded.token, lease.token);
+  assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
+});
+
+test('a background Pi session cannot register an inherited terminal return token', async t => {
+  const f = await fixture(t, [], { managedTerminal: true, background: true });
+  const lease = JSON.parse(await readFile(join(f.cwd, '.piq', 'terminal-return.json'), 'utf8'));
+  assert.equal(lease.piPid, undefined);
+  assert.equal(lease.wrapperPid, undefined);
+  assert.equal((await readRuntimeStatus(f.cwd))?.mode, 'background');
   assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
 });
