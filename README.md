@@ -1,6 +1,6 @@
 # PiQ Harness Old version
 
-**腾讯已开放官方“养鱼”渠道并且严厉打击第三方接口，使用该项目者后果自负。让 Pi 通过腾讯官方 QQBot 接口参与对话的新版 PiQ Harness 详见 [PiQ Harness](https://github.com/Gliese-876/PiQ-Harness)**
+**腾讯已开放官方“养鱼”渠道并且严厉打击第三方接口，使用本项目者后果自负。让 Pi 通过腾讯官方 QQBot 接口参与对话的新版 PiQ Harness 详见 [PiQ Harness](https://github.com/Gliese-876/PiQ-Harness)**
 
 把 SnowLuma 的 QQ 对话交给 Pi。**一个对话组对应一个 Pi Agent Session**，组内可包含多个群聊、好友私聊和群临时会话，共用配置、人设、记忆、模型与资料。
 
